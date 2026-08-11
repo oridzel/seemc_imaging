@@ -1,0 +1,3145 @@
+"""
+transport.py -- Monte Carlo simulation of secondary electron emission.
+
+This is the planar reference transport kernel for the standalone
+``seemc-imaging`` package.  It was forked from the validated optlib SEEMC
+implementation before scene geometry was introduced.  It reads the same
+material-database format and transports electrons through a semi-infinite
+solid using the analytic :class:`~seemc_imaging.geometry.Plane` backend.  The
+default plane retains the validated convention: solid at z > 0 and vacuum at
+z < 0.
+
+=============================================================================
+ENERGY CONVENTIONS  --  READ THIS BEFORE TOUCHING ANY TABLE LOOKUP
+=============================================================================
+Three different energy references appear in this code.  Mixing them up is the
+single easiest way to get a wrong answer, so every table lookup goes through a
+named converter in `Sample` and never touches `material_data` directly.
+
+    E_s     "solid" energy, measured from the BOTTOM OF THE VALENCE BAND.
+            This is the state variable carried by `Electron.energy` while the
+            electron is inside the solid.  It equals T' in Shinotsuka et al.,
+            Surf. Interface Anal. 47 (2015) 871, Eq. (2).
+
+    T       = E_s - E_F, measured from the FERMI LEVEL.  This is the abscissa
+            of the standard IMFP tables (Shinotsuka Table 2: "electron kinetic
+            energy T with respect to the Fermi level").
+
+    E_vac   = E_s - U_i  with  U_i = E_F + phi,  the kinetic energy the
+            electron would have in vacuum.  Used for emission, NOT for table
+            lookups.
+
+    NOTE ON THE ELASTIC TABLES.  It is tempting to assume ELSEPA is fed a
+    vacuum kinetic energy.  For the solid-state (muffin-tin) optical model it
+    is not.  Salvat/Jablonski/Powell, "elsepa ... (version 2020)", Eqs. (7)-(8):
+    outside the muffin-tin sphere the potential is the constant
+    V(r) = -Delta_E - i*Gamma, "the background potential of the projectile
+    within the solid", and the phase shifts are obtained from
+    V1(r) = V(r) + Delta_E + i*Gamma, WHICH VANISHES FOR r > Rmt.  Because V1
+    vanishes in the interstitial region, the asymptotic momentum corresponds
+    to the input energy EV directly: EV is the kinetic energy INSIDE the solid,
+    measured from the muffin-tin zero.  For a metal the muffin-tin zero is
+    essentially the band bottom and Delta_E is the inner potential, so
+
+            EV  ~=  E_s        (VB-bottom referenced, NOT vacuum)
+
+    Hence emfp_energy_ref defaults to 'vb_bottom'.  Getting this wrong shifts
+    the elastic lookup by U_i (13.4 eV for Cu) into the region where the cross
+    section is rising steeply, which collapses the low-energy elastic MFP and
+    with it the secondary-electron escape depth.
+
+Which reference each DB table uses is declared once, in `MCConfig`:
+
+    imfp_energy_ref  : 'vb_bottom' (default, matches the optlib FPA builder)
+                       or 'fermi'  (matches the published Shinotsuka tables)
+    emfp_energy_ref  : 'vb_bottom' (default, corrected solid-state ELSEPA
+                       convention described above)
+                       or 'vacuum' (legacy comparison only)
+
+KINEMATIC INVARIANTS (Shinotsuka Eq. 2-3) -- these are asserted, not assumed:
+
+    omega_max = T' - E_F = E_s - E_F        (maximum energy loss)
+    q_bounds  are evaluated at T' = E_s     (NOT at E_s - E_F)
+
+The relativistic momenta used for the q-bounds are also used for the
+projectile deflection, so the sampled q is guaranteed to lie in
+[|k - k'|, k + k'] and the law-of-cosines never needs clamping.
+
+=============================================================================
+CHANGELOG vs. the previous version
+=============================================================================
+Physics / correctness
+  1. A truncated step at the surface no longer forces a scattering event.
+     Previously every internal reflection was followed by a collision that the
+     exponential never generated, piling up spurious energy loss in exactly
+     the depth range that controls SEY.
+  2. Secondary-electron direction is now built from the momentum transfer q
+     (rotated out of the frame with z || q) instead of the ad-hoc rule
+     [pi - theta, phi + pi] applied to the *already deflected* projectile
+     direction.  Energy and momentum of the (projectile, SE) pair are now
+     consistent by construction.
+  3. `energy_se` can no longer leak from a previous collision: `scatter()`
+     returns an explicit result object instead of mutating shared state.
+  4. Rejected inelastic samples no longer silently become null collisions.
+     omega is drawn from a CDF truncated at omega_max, and q from a grid built
+     inside [q-, q+], so a valid event is produced every time.  The residual
+     failure modes are counted in `diagnostics`.
+  5. q-bounds evaluated at E_s (was E_s - E_F).  See above.
+  6. Projectile deflection uses relativistic momenta, consistent with the
+     q-bounds.
+  7. The incident beam is refracted at the surface barrier (parallel momentum
+     conserved), instead of keeping its vacuum direction.
+  8. Energy-bin lookup is stochastically interpolated between adjacent bins
+     instead of snapping to the nearest bin.
+  9. Unconditional death check at the top of the transport loop plus a step
+     counter, so a sub-barrier electron in a non-metal cannot loop forever.
+ 10. Contradictory q-unit handling removed: the DB's 'q' grid has one declared
+     unit (`MCConfig.q_unit`), validated at load time.
+
+Bookkeeping
+ 11. Emitted electrons are classified both by cascade flag and by the
+     conventional 50 eV cut, so results are comparable to measured
+     delta / eta curves and to MAST-SEY.
+ 12. Per-energy statistical uncertainties (standard error of the mean).
+ 13. Emission energy and angle spectra are collected.
+ 14. One shared trajectory implementation for serial and parallel runs.
+ 15. Reproducible seeding via numpy SeedSequence (no PID dependence).
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import pickle
+import warnings
+from dataclasses import asdict, dataclass, field
+from typing import Optional, Tuple
+
+import numpy as np
+from scipy.interpolate import RectBivariateSpline
+
+from .geometry import (
+    Geometry,
+    Plane,
+    SOLID_REGION,
+    SurfaceHit,
+    VACUUM_REGION,
+)
+
+
+_REFERENCE_PLANE = Plane()
+
+# --------------------------------------------------------------------------
+# Constants.  Defined locally so the module is self-contained and testable.
+# Their numerical values match the optlib snapshot from which this package was
+# forked; changing them would change seeded trajectories and must be treated as
+# a physics change rather than routine cleanup.
+# --------------------------------------------------------------------------
+# These are the values from the validated optlib snapshot.  That module adopted
+# optlib.constants at import time, so retaining those rounded values here is
+# required for bitwise-identical seeded trajectories after the fork.
+H2EV = 27.21184                 # Hartree -> eV
+A0_ANG = 0.529177               # Bohr radius in Angstrom
+HBAR2_2M_EVA2 = 0.5 * H2EV * A0_ANG ** 2   # hbar^2/2m in eV*Angstrom^2 (3.80998)
+C_AU = 137.035999084            # speed of light in atomic units
+
+# Backwards-compatible aliases (old code referenced these names)
+h2ev = H2EV
+a0 = A0_ANG
+HBAR2_2M_eVA2 = HBAR2_2M_EVA2
+
+# This package deliberately does not import optlib.  Keeping the numerical
+# constants local makes the new transport package independent while retaining
+# the exact values used by the validated snapshot.
+
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+@dataclass
+class MCConfig:
+    """Everything that used to be a magic number or an implicit assumption."""
+
+    # --- table energy references (see module docstring) ---
+    imfp_energy_ref: str = "vb_bottom"   # 'vb_bottom' (E_s) or 'fermi' (E_s - E_F)
+    # 'vb_bottom' is correct for ELSEPA's solid-state muffin-tin model: its
+    # input energy is the kinetic energy in the interstitial region, not in
+    # vacuum (see the module docstring and elsepa 2020 Eqs. 7-8).  'vacuum'
+    # is kept only to reproduce the earlier, incorrect behaviour.
+    emfp_energy_ref: str = "vb_bottom"
+
+    # --- units of material_data['q'] ---
+    q_unit: str = "a0^-1"                # 'a0^-1' or 'A^-1'
+
+    # --- elastic ---
+    elastic_min_energy: float = 5.0      # ELSEPA tables clamped below this (eV, vacuum ref)
+
+    # How the elastic CROSS SECTION behaves below elastic_cutoff_energy, where
+    # ELSEPA's solid-state model is no longer reliable.  JMONSEL offers exactly
+    # these choices, and they matter: its own Cu variants differ by a factor
+    # 1.46 in SEY at 50 eV, which is larger than the disagreement between codes.
+    #
+    #  'elsepa'   : hold the ELSEPA value at the cutoff (seemc's old behaviour;
+    #               NOT one of JMONSEL's options, listed for comparison).
+    #  'browning' : below the cutoff, follow the energy dependence of Browning's
+    #               empirical form, normalised to the ELSEPA value at the cutoff:
+    #                   sigma(E) = sigma_ELSEPA(Ec) * sigma_B(E) / sigma_B(Ec)
+    #               (Browning et al., J. Appl. Phys. 76 (1994) 2016.)  This is
+    #               "extrapolated from ELSEPA using Browning's empirical form".
+    #  'linear'   : sigma = 0 at E_F, = sigma_ELSEPA(Ec) at the cutoff, linear
+    #               in between.
+    #
+    # NOTE: only the total cross section (hence the elastic MFP) is modified.
+    # The angular distribution is held at its cutoff value, since the reference
+    # description specifies cross sections only.  If JMONSEL also swaps the
+    # angular distribution below the cutoff, this will not reproduce it exactly.
+    elastic_low_energy_model: str = "elsepa"
+    elastic_cutoff_energy: float = 50.0   # eV, in the emfp table's own reference
+    atomic_number: Optional[float] = None  # needed by 'browning'; else from DB
+
+    # --- surface barrier ---
+    # 'abrupt'   : T = 4r/(1+r)^2, r = sqrt(1 - Ui/E_perp).  Abrupt step.
+    #              ('quantum' is accepted as a synonym.)
+    # 'classical': T = 1 whenever E_perp > Ui.
+    # 'expqm'    : JMONSEL's barrier (Villarrubia 2015 Eq. 11), U(x) rising as
+    #              dU/[1+exp(-2x/w)] over width w = barrier_width (ANGSTROM).
+    #              w -> 0 recovers 'abrupt'; w -> infinity recovers 'classical'.
+    #              NOTE: Villarrubia 2015 states its own simulations used the
+    #              CLASSICAL limit, so JMONSEL reference curves are most likely
+    #              classical, not abrupt.  The abrupt step is the lowest-
+    #              transmission choice and gives the lowest SEY of the three.
+    barrier_model: str = "abrupt"
+    barrier_width: float = 0.0           # w in ANGSTROM, used by 'expqm' only
+
+    # --- how the SE-generation mechanism is decided ---
+    # 'mao'  : Mao et al. 2008 Eq. (9).  After (omega, q) are sampled, single
+    #          electron excitation is declared if q- <= q <= q+, and plasmon
+    #          damping if q < q-, with
+    #              q_mp = -/+ k_F + sqrt(k_F^2 + 2 omega)      [atomic units]
+    #          This is EXACTLY the condition for the Fermi-sphere disk to be
+    #          non-empty, so the binary-encounter sampler can never fail and
+    #          no excitation is ever lost.  RECOMMENDED.
+    # 'table': trust the DB's elf_se / elf_pl split to also define the SE
+    #          mechanism.  This is only equivalent to 'mao' if the tables were
+    #          built with the same k_F that the DB reports as e_fermi.  For an
+    #          FPA database they generally were NOT: the FPA decomposition
+    #          integrates over a plasmon frequency omega_p that scans the whole
+    #          optical range, so the support of elf_se is set by the LARGEST
+    #          k_F(omega_p) in the decomposition, not by the material's k_F.
+    #          The result is elf_se strength at q < q-, where no target state
+    #          exists -- silently destroying secondaries.
+    se_channel_rule: str = "mao"
+
+    # --- FEG parameters used by the binary-encounter SE model ---
+    # k_F for the struck-electron sampling is normally taken from the DB's
+    # e_fermi.  For a d-band metal that is often WRONG: optlib's Penn/FPA
+    # extension disperses the ELF using an electron density inferred from the
+    # f-sum rule (for Cu that is ~11 e/atom, E_F ~ 35 eV), while `e_fermi` in
+    # the DB is the true Fermi energy (~8.7 eV, ~1 e/atom).  If those disagree,
+    # the pair continuum implied by the ELF is much wider than the one the
+    # sampler enforces, and a large fraction of (omega, q) pairs get Pauli
+    # rejected -- each rejection is a secondary electron that never existed.
+    # Set this to the density-equivalent E_F to make them consistent.
+    feg_fermi_energy: Optional[float] = None
+
+    # What to do when the FEG kinematics forbid the sampled (omega, q):
+    # 'fallback' : still create a secondary, with E_SE = E_i + omega drawn from
+    #              the occupied DOS (the plasmon-channel construction).  Energy
+    #              is conserved and no excitation is lost.
+    # 'drop'     : create no secondary (the previous behaviour).  The projectile
+    #              still loses omega, so this is a silent energy sink and a
+    #              direct SEY deficit.
+    on_pauli_block: str = "fallback"
+
+    # --- secondary electron generation ---
+    # 'momentum' : SE direction from k_f = k_i + q, rotated out of the q frame.
+    # 'isotropic': SE emitted isotropically (debug / comparison only).
+    se_direction_model: str = "momentum"
+    # Plasmon decay is a Landau-damping event at q ~ q_c that is uncorrelated
+    # with the incident direction; isotropic is the standard choice
+    # (Ding & Shimizu).  'momentum' reuses the binary-encounter construction.
+    plasmon_se_direction: str = "isotropic"
+
+    # --- termination ---
+    # An electron with E_s <= U_i can never escape through a step barrier and
+    # cannot gain energy, so tracking it only costs time.  Set True if you add
+    # phonon transport or want energy-deposition maps.
+    track_subbarrier: bool = False
+    max_steps_per_electron: int = 100_000
+    max_generation: int = 100
+    max_secondaries_per_trajectory: int = 100_000
+
+    # --- classification ---
+    bse_cutoff_ev: float = 50.0          # conventional SE/BSE split on emission energy
+
+    # --- sampling resolution ---
+    n_q_sample: int = 64                 # points used to build the conditional q CDF
+    n_theta_dcs: int = 0                 # 0 = use the DB's native theta grid
+
+    # --- diagnostics ---
+    collect_spectra: bool = True
+    # Record the depth at which every secondary is CREATED (not just the ones
+    # that escape).  Needed to measure the escape probability vs depth, i.e.
+    # the SE escape depth, without assuming a functional form.
+    collect_birth_depths: bool = False
+
+    def validate(self) -> None:
+        if self.imfp_energy_ref not in ("vb_bottom", "fermi"):
+            raise ValueError(f"bad imfp_energy_ref: {self.imfp_energy_ref}")
+        if self.emfp_energy_ref not in ("vacuum", "vb_bottom"):
+            raise ValueError(f"bad emfp_energy_ref: {self.emfp_energy_ref}")
+        if self.q_unit not in ("a0^-1", "A^-1"):
+            raise ValueError(f"bad q_unit: {self.q_unit}")
+        if self.se_direction_model not in ("momentum", "isotropic"):
+            raise ValueError(f"bad se_direction_model: {self.se_direction_model}")
+        if self.plasmon_se_direction not in ("momentum", "isotropic"):
+            raise ValueError(f"bad plasmon_se_direction: {self.plasmon_se_direction}")
+        if self.barrier_model == "quantum":
+            self.barrier_model = "abrupt"        # backwards-compatible synonym
+        _alias = {"quantum": "abrupt", "sigmoid": "expqm", "jmonsel": "expqm"}
+        self.barrier_model = _alias.get(self.barrier_model, self.barrier_model)
+        if self.barrier_model not in ("abrupt", "classical", "expqm"):
+            raise ValueError(f"bad barrier_model: {self.barrier_model}")
+        if self.barrier_model == "expqm" and self.barrier_width <= 0:
+            raise ValueError(
+                "barrier_model='expqm' requires barrier_width > 0 (Angstrom); "
+                "use 'abrupt' for w->0 or 'classical' for w->infinity"
+            )
+        if self.se_channel_rule not in ("mao", "table"):
+            raise ValueError(f"bad se_channel_rule: {self.se_channel_rule}")
+        if self.elastic_low_energy_model not in ("elsepa", "browning", "linear"):
+            raise ValueError(
+                f"bad elastic_low_energy_model: {self.elastic_low_energy_model}")
+        if self.on_pauli_block not in ("fallback", "drop"):
+            raise ValueError(f"bad on_pauli_block: {self.on_pauli_block}")
+
+
+# --------------------------------------------------------------------------
+# Small numerical helpers
+# --------------------------------------------------------------------------
+def cumtrapz_numpy(y, x):
+    """Cumulative trapezoid integral, same length as x, starting at 0."""
+    y = np.asarray(y, dtype=float)
+    x = np.asarray(x, dtype=float)
+    area = 0.5 * (y[1:] + y[:-1]) * np.diff(x)
+    return np.concatenate(([0.0], np.cumsum(area)))
+
+
+def _invert_cdf(cdf, x, u):
+    """
+    Invert a monotonically non-decreasing CDF by linear interpolation.
+
+    Unlike np.interp(u, cdf, x) this is safe when the CDF has flat regions
+    (zero-probability gaps in the ELF), which np.interp resolves arbitrarily.
+
+    Uses the ndarray.searchsorted method rather than np.searchsorted: the
+    module-level function goes through numpy's dispatch wrapper, which
+    dominates the runtime when it is called a few hundred times per
+    trajectory on scalars.
+    """
+    j = int(cdf.searchsorted(u, side="right")) - 1
+    n2 = len(x) - 2
+    j = 0 if j < 0 else (n2 if j > n2 else j)
+    c0, c1 = float(cdf[j]), float(cdf[j + 1])
+    if c1 <= c0:
+        return float(x[j])
+    t = (u - c0) / (c1 - c0)
+    return float(x[j] + t * (x[j + 1] - x[j]))
+
+
+def _bin_and_fraction(grid, value):
+    """Return (i, t) with grid[i] <= value <= grid[i+1] and t the fraction."""
+    n = len(grid)
+    if n < 2:
+        return 0, 0.0
+    lo, hi = grid[0], grid[-1]
+    v = lo if value < lo else (hi if value > hi else float(value))
+    i = int(grid.searchsorted(v, side="right")) - 1
+    n2 = n - 2
+    i = 0 if i < 0 else (n2 if i > n2 else i)
+    span = grid[i + 1] - grid[i]
+    t = 0.0 if span <= 0 else (v - grid[i]) / span
+    return i, float(np.clip(t, 0.0, 1.0))
+
+
+def _k_rel_au(E_ev):
+    """
+    Relativistic electron momentum in atomic units (a0^-1) for energy E_ev.
+
+        k = sqrt(E (2 + E/c^2))     [Hartree atomic units]
+
+    Same expression as Shinotsuka Eq. (2); used for BOTH the q-bounds and the
+    projectile deflection so the two can never disagree.
+    """
+    e = max(float(E_ev), 0.0) / H2EV
+    return math.sqrt(e * (2.0 + e / (C_AU ** 2)))
+
+
+def _sinh_ratio(a, b):
+    """
+    sinh(a)/sinh(b) for 0 <= a <= b, without overflowing.
+
+    Both arguments exceed the float range for any realistic barrier width above
+    a few tens of eV, so the ratio is evaluated as
+
+        sinh(a)/sinh(b) = exp(a-b) * expm1(-2a) / expm1(-2b)
+
+    which stays accurate as a -> 0 (expm1 avoids the 1 - exp cancellation that
+    a naive 1 - exp(-2a) suffers when a is small).
+    """
+    if b <= 0.0:
+        return 1.0
+    if a <= 0.0:
+        return 0.0
+    d = a - b
+    if d < -700.0:
+        return 0.0
+    return math.exp(d) * math.expm1(-2.0 * a) / math.expm1(-2.0 * b)
+
+
+def barrier_transmission(E_perp, Ui, cfg):
+    """
+    Transmission through the surface barrier, given the energy of motion
+    perpendicular to the surface.
+
+    All three models are the same physics in different limits.  Villarrubia
+    et al., Ultramicroscopy 154 (2015), Section 3.6, adopt the exponential
+    s-curve potential
+
+        U(x) = dU / [1 + exp(-2x/w)]
+
+    for which Schroedinger's equation is solved exactly (their Eq. 11):
+
+        T = 1 - [ sinh(pi w (k1 - k2)/2) / sinh(pi w (k1 + k2)/2) ]^2
+                                                   for E cos^2(theta) > dU
+        T = 0                                      otherwise
+
+        k1 = sqrt(2 m E cos^2 theta) / hbar
+        k2 = sqrt(2 m (E cos^2 theta - dU)) / hbar
+
+    'expqm'     the formula above; cfg.barrier_width = w in ANGSTROM.
+                Synonyms: 'sigmoid', 'jmonsel'.
+    'abrupt'    the w -> 0 limit.  sinh(x) -> x gives T = 4 k1 k2 / (k1+k2)^2,
+                the abrupt step used by Ding & Shimizu and by Mao et al.  It is
+                the LOWEST-transmission choice of the three.
+                Synonym: 'quantum'.
+    'classical' the w -> infinity limit, T = 1 above the barrier.
+
+    For a JMONSEL comparison: Villarrubia 2015 states that its own boundary
+    crossings were computed in the CLASSICAL limit, so reference curves from
+    that code are most likely classical rather than abrupt.  A real surface is
+    neither limit, so 'expqm' with w of order 1-5 A is the defensible middle
+    ground -- with w acting as a fit parameter.
+    """
+    if E_perp <= Ui:
+        return 0.0
+
+    model = cfg.barrier_model
+    if model == "classical":
+        return 1.0
+
+    # k in Angstrom^-1, so that w*k is dimensionless with w in Angstrom
+    k1 = math.sqrt(2.0 * E_perp / H2EV) / A0_ANG
+    k2 = math.sqrt(2.0 * (E_perp - Ui) / H2EV) / A0_ANG
+
+    if model == "abrupt":
+        return 4.0 * k1 * k2 / ((k1 + k2) ** 2)
+
+    w = cfg.barrier_width
+    r = _sinh_ratio(0.5 * math.pi * w * (k1 - k2), 0.5 * math.pi * w * (k1 + k2))
+    return max(0.0, min(1.0, 1.0 - r * r))
+
+
+def browning_cross_section(E_ev, Z):
+    """
+    Browning's empirical total elastic cross section (Browning, Li, Chui, Ye,
+    Pease, Czyzewski & Joy, J. Appl. Phys. 76 (1994) 2016), in cm^2:
+
+        sigma(E) = 3.0e-18 Z^1.7 / (E + 0.005 Z^1.7 sqrt(E) + 0.0007 Z^2 / sqrt(E))
+
+    with E in keV.  Fitted for 0.1-30 keV, so using it below 100 eV really is
+    an extrapolation -- which is precisely how it is being used here.  Only the
+    RATIO to its value at the cutoff is used, so the absolute normalisation and
+    the Z^1.7 prefactor cancel; Z still enters through the denominator.
+
+    Note the low-energy limit: the 0.0007 Z^2 / sqrt(E) term dominates as
+    E -> 0, so sigma ~ sqrt(E) -> 0 and the elastic MFP diverges.
+    """
+    E = max(float(E_ev), 1e-9) / 1000.0
+    z17 = Z ** 1.7
+    rt = math.sqrt(E)
+    return 3.0e-18 * z17 / (E + 0.005 * z17 * rt + 0.0007 * Z * Z / rt)
+
+
+def _isotropic_direction(rng):
+    cos_t = 2.0 * rng.random() - 1.0
+    sin_t = math.sqrt(max(1.0 - cos_t * cos_t, 0.0))
+    phi = 2.0 * math.pi * rng.random()
+    return [sin_t * math.cos(phi), sin_t * math.sin(phi), cos_t]
+
+
+def rotate_direction(uvw, polar, azimuth):
+    """
+    Rotate the unit vector `uvw` by `polar` away from its own axis and
+    `azimuth` about it.  (Unchanged from the original `change_direction`,
+    which was correct, including the uvw ~ +/-z degenerate case.)
+    """
+    sin_psi = math.sin(polar)
+    cos_psi = math.cos(polar)
+    sin_fi = math.sin(azimuth)
+    cos_fi = math.cos(azimuth)
+
+    cos_theta = uvw[2]
+    sin_theta = math.sqrt(max(uvw[0] ** 2 + uvw[1] ** 2, 0.0))
+    if sin_theta > 1e-12:
+        cos_phi = uvw[0] / sin_theta
+        sin_phi = uvw[1] / sin_theta
+    else:
+        cos_phi, sin_phi = 1.0, 0.0
+
+    h0 = sin_psi * cos_fi
+    h1 = sin_theta * cos_psi + h0 * cos_theta
+    h2 = sin_psi * sin_fi
+
+    out = [
+        h1 * cos_phi - h2 * sin_phi,
+        h1 * sin_phi + h2 * cos_phi,
+        cos_theta * cos_psi - h0 * sin_theta,
+    ]
+    norm = math.sqrt(out[0] ** 2 + out[1] ** 2 + out[2] ** 2)
+    if norm > 0:
+        out = [v / norm for v in out]
+    return out
+
+
+class Diagnostics(dict):
+    """Counter bag.  Every silent fallback in the physics increments one."""
+
+    _KEYS = (
+        "inelastic_events",
+        "elastic_events",
+        "surface_encounters",
+        "escapes",
+        "internal_reflections",
+        "se_created",
+        "se_blocked_pauli",       # FEG kinematics forbade a target state
+        "se_pauli_fallback",      # ... and a DOS-based secondary was made instead
+        "channel_reclassified",   # table channel != Mao q-boundary channel
+        "se_below_barrier",       # SE created but cannot escape -> not tracked
+        "omega_cdf_empty",        # energy bin had no inelastic strength
+        "q_window_clipped",       # [q-, q+] extended past the tabulated q grid
+        "q_cdf_empty",            # ELF integrated to zero inside [q-, q+]
+        "step_limit_hit",
+        "generation_limit_hit",
+    )
+
+    def __init__(self):
+        super().__init__({k: 0 for k in self._KEYS})
+
+    def add(self, other):
+        for k, v in other.items():
+            self[k] = self.get(k, 0) + v
+
+    def report(self, n_trajectories=None):
+        lines = ["Diagnostics:"]
+        for k in sorted(self):
+            v = self[k]
+            if n_trajectories:
+                lines.append(f"  {k:<24s} {v:>12d}   ({v / n_trajectories:.4g}/traj)")
+            else:
+                lines.append(f"  {k:<24s} {v:>12d}")
+        return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Sample
+# --------------------------------------------------------------------------
+class Sample:
+    """Material tables plus every sampling routine that depends only on them."""
+
+    def __init__(self, name, db_path="MaterialDatabase.pkl", config: Optional[MCConfig] = None):
+        self.cfg = config or MCConfig()
+        self.cfg.validate()
+
+        with open(db_path, "rb") as fp:
+            data = pickle.load(fp)
+
+        if isinstance(data, dict):
+            if data.get("name") != name:
+                raise ValueError(f"DB holds '{data.get('name')}', requested '{name}'")
+            self.material_data = data
+        elif isinstance(data, list):
+            names = [d.get("name") for d in data]
+            if name not in names:
+                raise ValueError(f"Allowed sample names are {names}")
+            self.material_data = next(d for d in data if d.get("name") == name)
+        else:
+            raise ValueError("Unrecognized MaterialDatabase.pkl format")
+
+        md = self.material_data
+        self.name = md["name"]
+        self.is_metal = bool(md["is_metal"])
+
+        self.Egrid = np.asarray(md["energy"], dtype=float)
+        if not np.all(np.diff(self.Egrid) > 0):
+            raise ValueError("material_data['energy'] must be strictly increasing")
+        self.Emin = float(self.Egrid[0])
+        self.Emax = float(self.Egrid[-1])
+
+        self.e_fermi = float(md.get("e_fermi", 0.0))
+        self.work_function = float(md.get("work_function", 0.0))
+        self.Ui = self.e_fermi + self.work_function     # VB bottom -> vacuum level
+        self.e_vb = float(md.get("e_vb", 0.0))
+
+        # Fermi energy used ONLY by the binary-encounter SE kinematics.  Kept
+        # separate from self.e_fermi (which sets omega_max and the barrier)
+        # because for a d-band metal they legitimately differ -- see
+        # MCConfig.feg_fermi_energy.
+        self.e_fermi_feg = float(
+            self.cfg.feg_fermi_energy if self.cfg.feg_fermi_energy is not None
+            else self.e_fermi
+        )
+        self.k_fermi_feg = math.sqrt(max(2.0 * self.e_fermi_feg / H2EV, 0.0))
+
+        self.Z_eff = self.cfg.atomic_number
+        if self.Z_eff is None:
+            for key in ("atomic_number", "Z", "z", "mean_atomic_number"):
+                if key in md:
+                    self.Z_eff = float(np.mean(np.asarray(md[key], float)))
+                    break
+        if self.Z_eff is None and "composition" in md:
+            comp = md["composition"]
+            zs = getattr(comp, "atomic_numbers", None)
+            ws = getattr(comp, "indices", None)
+            if zs is not None and ws is not None:
+                self.Z_eff = float(np.average(np.asarray(zs, float),
+                                              weights=np.asarray(ws, float)))
+        if self.cfg.elastic_low_energy_model == "browning" and self.Z_eff is None:
+            raise ValueError(
+                "elastic_low_energy_model='browning' needs the atomic number; "
+                "no Z found in the database, so set MCConfig(atomic_number=...)"
+            )
+
+        self.imfp_table = np.asarray(md["imfp"], dtype=float)
+        self.emfp_table = np.asarray(md["emfp"], dtype=float)
+        # Interpolate the inverse MFPs directly: they are what the transport
+        # needs, and this avoids a division per step plus the 1/0 guards.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            self.inv_imfp_table = np.where(self.imfp_table > 0, 1.0 / self.imfp_table, 0.0)
+            self.inv_emfp_table = np.where(self.emfp_table > 0, 1.0 / self.emfp_table, 0.0)
+        self.inv_imfp_table[~np.isfinite(self.inv_imfp_table)] = 0.0
+        self.inv_emfp_table[~np.isfinite(self.inv_emfp_table)] = 0.0
+        self._check_table_shapes()
+
+        self._precompute_elastic_cdfs()
+        self._precompute_inelastic_channel_cdfs()
+        self._build_elf_channel_splines()
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+    def _check_table_shapes(self):
+        n = self.Egrid.size
+        for key in ("imfp", "emfp", "inv_imfp_pl", "inv_imfp_se"):
+            arr = np.asarray(self.material_data[key], dtype=float)
+            if arr.shape != (n,):
+                raise ValueError(f"material_data['{key}'] has shape {arr.shape}, expected ({n},)")
+
+        decs = np.asarray(self.material_data["decs"], dtype=float)
+        theta = np.asarray(self.material_data["decs_theta"], dtype=float)
+        if decs.shape != (theta.size, n):
+            raise ValueError(
+                f"decs has shape {decs.shape}, expected ({theta.size}, {n}); the elastic "
+                "tables must share the 'energy' grid"
+            )
+
+        for key in ("diimfp_se", "diimfp_pl"):
+            arr = np.asarray(self.material_data[key], dtype=float)
+            if arr.ndim != 3 or arr.shape[1] != 2 or arr.shape[2] != n:
+                raise ValueError(
+                    f"material_data['{key}'] has shape {arr.shape}, expected (Nw, 2, {n})"
+                )
+
+    def consistency_report(self):
+        """
+        Cross-checks worth running once per material.  These catch the class of
+        bug that produces a plausible-looking but wrong SEY curve.
+        """
+        md = self.material_data
+        lines = [f"Consistency report for {self.name}", "-" * 46]
+
+        inv_tot = np.asarray(md["inv_imfp_pl"], float) + np.asarray(md["inv_imfp_se"], float)
+        # Only bins that carry inelastic strength are meaningful: below E_F + the
+        # smallest excitation there is nothing to compare.
+        live = inv_tot > 0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rel = np.abs(inv_tot[live] * self.imfp_table[live] - 1.0)
+        rel = rel[np.isfinite(rel)]
+        worst = float(np.max(rel)) if rel.size else float("nan")
+        lines.append(
+            f"  1/imfp vs (inv_imfp_pl + inv_imfp_se): max rel. deviation {worst:.3%}"
+        )
+        if worst > 0.02:
+            lines.append(
+                "     WARNING: the transport rate and the channel decomposition disagree. "
+                "The channel branching will not reproduce the tabulated IMFP."
+            )
+
+        q = np.asarray(md["q"], float)
+        lines.append(
+            f"  q grid: [{q.min():.4g}, {q.max():.4g}] declared as {self.cfg.q_unit}"
+        )
+        # A physically sensible grid must span the momentum transfers that the
+        # kinematics actually demand at the top of the energy range.
+        k_top = _k_rel_au(self.Emax)
+        q_top = 2.0 * k_top if self.cfg.q_unit == "a0^-1" else 2.0 * k_top / A0_ANG
+        if q.max() < 0.5 * q_top:
+            lines.append(
+                f"     WARNING: q_max = {q.max():.4g} is far below the 2k = {q_top:.4g} "
+                f"required at E = {self.Emax:.4g} eV. Check q_unit."
+            )
+
+        lines.append(f"  E_F = {self.e_fermi:.3f} eV, phi = {self.work_function:.3f} eV, "
+                     f"U_i = {self.Ui:.3f} eV")
+        lines.append(f"  IMFP tabulated vs '{self.cfg.imfp_energy_ref}', "
+                     f"EMFP vs '{self.cfg.emfp_energy_ref}'")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Energy reference conversions -- the ONLY places a reference is applied
+    # ------------------------------------------------------------------
+    def E_fermi_ref(self, E_s):
+        return E_s - self.e_fermi
+
+    def E_vacuum_ref(self, E_s):
+        return E_s - self.Ui
+
+    def _imfp_abscissa(self, E_s):
+        return E_s if self.cfg.imfp_energy_ref == "vb_bottom" else self.E_fermi_ref(E_s)
+
+    def _emfp_abscissa(self, E_s):
+        if self.cfg.emfp_energy_ref == "vacuum":
+            # ELSEPA is tabulated against vacuum kinetic energy; below the
+            # tabulated minimum the DCS is frozen at elastic_min_energy.
+            return max(self.E_vacuum_ref(E_s), self.cfg.elastic_min_energy)
+        return E_s
+
+    def _clip_E(self, E):
+        # Plain comparisons: np.clip on a scalar costs ~8 us of dispatch
+        # overhead and this is the single hottest call in the transport loop.
+        if E < self.Emin:
+            return self.Emin
+        if E > self.Emax:
+            return self.Emax
+        return float(E)
+
+    # ------------------------------------------------------------------
+    # Mean free paths
+    # ------------------------------------------------------------------
+    def elastic_sigma_scale(self, E_s):
+        """
+        Multiplier on the elastic cross section relative to its value at the
+        cutoff. Returns 1.0 at and above the cutoff.
+        """
+        m = self.cfg.elastic_low_energy_model
+        Ec = self.cfg.elastic_cutoff_energy
+        if m == "elsepa" or E_s >= Ec:
+            return 1.0
+        if m == "linear":
+            EF = self.e_fermi
+            if E_s <= EF:
+                return 0.0
+            return (E_s - EF) / max(Ec - EF, 1e-9)
+        return (browning_cross_section(E_s, self.Z_eff)
+                / browning_cross_section(Ec, self.Z_eff))
+
+    def get_imfp(self, E_s):
+        E = self._clip_E(self._imfp_abscissa(E_s))
+        return float(np.interp(E, self.Egrid, self.imfp_table))
+
+    def get_emfp(self, E_s):
+        m = self.cfg.elastic_low_energy_model
+        Ec = self.cfg.elastic_cutoff_energy
+        if m == "elsepa" or E_s >= Ec:
+            E = self._clip_E(self._emfp_abscissa(E_s))
+            return float(np.interp(E, self.Egrid, self.emfp_table))
+        # Anchor on the ELSEPA value AT the cutoff, then rescale the cross
+        # section (EMFP scales as 1/sigma).
+        E = self._clip_E(self._emfp_abscissa(Ec))
+        emfp_c = float(np.interp(E, self.Egrid, self.emfp_table))
+        f = self.elastic_sigma_scale(E_s)
+        return emfp_c / f if f > 0 else float("inf")
+
+    def inverse_mfps(self, E_s):
+        """(1/emfp, 1/imfp) at E_s.  Evaluated once per transport step."""
+        m = self.cfg.elastic_low_energy_model
+        Ec = self.cfg.elastic_cutoff_energy
+        if m == "elsepa" or E_s >= Ec:
+            inv_e = float(np.interp(self._clip_E(self._emfp_abscissa(E_s)),
+                                    self.Egrid, self.inv_emfp_table))
+        else:
+            inv_e = float(np.interp(self._clip_E(self._emfp_abscissa(Ec)),
+                                    self.Egrid, self.inv_emfp_table)
+                          ) * self.elastic_sigma_scale(E_s)
+        if self.is_metal and E_s <= self.e_fermi:
+            inv_i = 0.0            # no inelastic channel below E_F
+        else:
+            inv_i = float(np.interp(self._clip_E(self._imfp_abscissa(E_s)),
+                                    self.Egrid, self.inv_imfp_table))
+        return inv_e, inv_i
+
+    def omega_max(self, E_s):
+        """Shinotsuka Eq. (3): omega_max = T' - E_F for a metal."""
+        return E_s - self.e_fermi if self.is_metal else E_s
+
+    # ------------------------------------------------------------------
+    # Elastic
+    # ------------------------------------------------------------------
+    def _precompute_elastic_cdfs(self):
+        theta = np.asarray(self.material_data["decs_theta"], dtype=float)
+        decs = np.asarray(self.material_data["decs"], dtype=float)
+
+        if not np.all(np.diff(theta) > 0):
+            raise ValueError("decs_theta must be strictly increasing")
+
+        pdf = 2.0 * np.pi * decs * np.sin(theta)[:, None]
+        pdf = np.nan_to_num(pdf, nan=0.0, posinf=0.0, neginf=0.0)
+        pdf[pdf < 0] = 0.0
+
+        area = 0.5 * (pdf[1:, :] + pdf[:-1, :]) * np.diff(theta)[:, None]
+        cdf = np.vstack([np.zeros((1, pdf.shape[1])), np.cumsum(area, axis=0)])
+
+        total = cdf[-1, :]
+        good = (total > 0) & np.isfinite(total)
+        if not np.all(good):
+            bad = np.where(~good)[0]
+            raise ValueError(
+                f"Elastic DCS integrates to zero at energy bins {bad[:5].tolist()}"
+                f"{' ...' if bad.size > 5 else ''}. The old code silently replaced these "
+                "with a uniform-in-theta distribution, which is not isotropic and not "
+                "physical; fix the table instead."
+            )
+        cdf /= total
+
+        self._elastic_theta = theta
+        self._elastic_cdf = cdf
+
+    def mean_cos_elastic(self, E_s):
+        """<cos theta> of the elastic DCS, for the transport MFP."""
+        trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+        i, t = _bin_and_fraction(self.Egrid, self._clip_E(self._emfp_abscissa(E_s)))
+        th = self._elastic_theta
+        decs = np.asarray(self.material_data["decs"], float)
+        d = (1.0 - t) * decs[:, i] + t * decs[:, i + 1]
+        pdf = 2.0 * np.pi * d * np.sin(th)
+        norm = trapz(pdf, th)
+        return float(trapz(pdf * np.cos(th), th) / norm) if norm > 0 else 0.0
+
+    def sample_elastic_theta(self, E_s, rng):
+        """
+        Sample the elastic polar deflection, interpolating between energy bins.
+
+        Below elastic_cutoff_energy the DCS shape is held at its cutoff value:
+        the low-energy models redefine the total cross section only.
+        """
+        E_look = E_s
+        if self.cfg.elastic_low_energy_model != "elsepa":
+            E_look = max(E_s, self.cfg.elastic_cutoff_energy)
+        i, t = _bin_and_fraction(self.Egrid, self._clip_E(self._emfp_abscissa(E_look)))
+        j = i + 1 if (t > 0.0 and rng.random() < t) else i
+        return _invert_cdf(self._elastic_cdf[:, j], self._elastic_theta, rng.random())
+
+    # ------------------------------------------------------------------
+    # Inelastic: omega CDFs per channel per energy bin
+    # ------------------------------------------------------------------
+    def _precompute_inelastic_channel_cdfs(self):
+        def build(key):
+            di = np.asarray(self.material_data[key], float)      # (Nw, 2, NE)
+            eloss = di[:, 0, :]
+            pdf = np.nan_to_num(di[:, 1, :], nan=0.0, posinf=0.0, neginf=0.0)
+            pdf[pdf < 0] = 0.0
+
+            area = 0.5 * (pdf[1:, :] + pdf[:-1, :]) * np.diff(eloss, axis=0)
+            cdf = np.vstack([np.zeros((1, area.shape[1])), np.cumsum(area, axis=0)])
+            total = cdf[-1, :]
+            has = (total > 0) & np.isfinite(total)
+            # NOTE: kept UNNORMALISED.  Truncating at omega_max requires the
+            # absolute cumulative value; normalising here and renormalising
+            # later is what made the old sampler reject-and-drop.
+            return eloss, cdf, has
+
+        self._w_se, self._cdf_se, self._has_se = build("diimfp_se")
+        self._w_pl, self._cdf_pl, self._has_pl = build("diimfp_pl")
+
+    def _channel_tables(self, ch):
+        if ch == "se":
+            return self._w_se, self._cdf_se, self._has_se
+        return self._w_pl, self._cdf_pl, self._has_pl
+
+    def choose_channel(self, E_s, rng):
+        E = self._clip_E(self._imfp_abscissa(E_s))
+        inv_pl = float(np.interp(E, self.Egrid, self.material_data["inv_imfp_pl"]))
+        inv_se = float(np.interp(E, self.Egrid, self.material_data["inv_imfp_se"]))
+        s = inv_pl + inv_se
+        if not np.isfinite(s) or s <= 0.0:
+            return None
+        return "pl" if (rng.random() < inv_pl / s) else "se"
+
+    def sample_energy_loss(self, ch, E_s, rng, diag):
+        """
+        Draw omega from the channel DIIMFP, with the CDF truncated at
+        omega_max = E_s - E_F.  Truncating BEFORE sampling (rather than
+        sampling then rejecting) keeps the realised inelastic rate equal to
+        1/imfp; the old code's post-hoc rejection quietly lengthened the
+        effective IMFP and softened the stopping power.
+        """
+        w_all, cdf_all, has = self._channel_tables(ch)
+
+        i, t = _bin_and_fraction(self.Egrid, self._clip_E(self._imfp_abscissa(E_s)))
+        j = i + 1 if (t > 0.0 and rng.random() < t) else i
+        if not has[j]:
+            diag["omega_cdf_empty"] += 1
+            return None
+
+        wgrid = w_all[:, j]
+        cdf = cdf_all[:, j]
+
+        w_max = min(self.omega_max(E_s), float(wgrid[-1]))
+        if w_max <= float(wgrid[0]):
+            diag["omega_cdf_empty"] += 1
+            return None
+
+        c_max = float(np.interp(w_max, wgrid, cdf))
+        if c_max <= 0.0 or not np.isfinite(c_max):
+            diag["omega_cdf_empty"] += 1
+            return None
+
+        omega = _invert_cdf(cdf, wgrid, rng.random() * c_max)
+        omega = min(omega, w_max)
+        return omega if omega > 0.0 else None
+
+    # ------------------------------------------------------------------
+    # Inelastic: q sampling from the channel-resolved ELF
+    # ------------------------------------------------------------------
+    def _build_elf_channel_splines(self):
+        md = self.material_data
+        omega_h = np.asarray(md["omega"], float) / H2EV
+        q_raw = np.asarray(md["q"], float)
+        # ONE declared unit for the whole module (the old code read this key as
+        # A^-1 in elf_spline() and as a0^-1 in elf_channel_splines()).
+        q_a0inv = q_raw if self.cfg.q_unit == "a0^-1" else q_raw * A0_ANG
+        if np.any(q_a0inv <= 0):
+            raise ValueError("material_data['q'] must be strictly positive for log-q sampling")
+        qlog = np.log(q_a0inv)
+
+        elf_se = np.asarray(md["elf_se"], float)
+        elf_pl = np.asarray(md["elf_pl"], float)
+        if elf_se.shape != (omega_h.size, qlog.size):
+            if elf_se.shape == (qlog.size, omega_h.size):
+                elf_se = elf_se.T
+                elf_pl = elf_pl.T
+            else:
+                raise ValueError(
+                    f"ELF shape {elf_se.shape} matches neither (Nw, Nq) = "
+                    f"({omega_h.size}, {qlog.size}) nor its transpose"
+                )
+
+        self._omega_h_grid = omega_h
+        self._qlog_grid = qlog
+        self._elf_spl = {
+            "se": RectBivariateSpline(omega_h, qlog, elf_se, kx=1, ky=1),
+            "pl": RectBivariateSpline(omega_h, qlog, elf_pl, kx=1, ky=1),
+        }
+
+    def mao_q_boundaries(self, omega):
+        """
+        Mao et al. 2008, Eq. (9): the edges of the single-electron-excitation
+        region, in atomic units (a0^-1).
+
+            q_-+ = -/+ k_F + sqrt(k_F^2 + 2 omega)
+
+        For q in [q_-, q_+] the Fermi-sphere disk of Eq. (18) is non-empty and
+        a single-electron excitation is kinematically allowed.  For q < q_- the
+        loss is a plasmon (the plasmon dispersion line terminates at q_-).
+        """
+        wh = max(float(omega), 0.0) / H2EV
+        kF = self.k_fermi_feg
+        root = math.sqrt(kF * kF + 2.0 * wh)
+        return root - kF, root + kF
+
+    def qlog_bounds(self, E_s, omega):
+        """
+        Relativistic momentum-transfer bounds in log(q / a0^-1).
+
+        Shinotsuka Eq. (2): the bounds are evaluated at T' = E_s, the
+        VB-bottom-referenced energy -- NOT at E_s - E_F.  Using E_s - E_F
+        here (as the previous version did) narrows the q window and biases
+        every inelastic deflection angle.
+        """
+        k = _k_rel_au(E_s)
+        kp = _k_rel_au(max(E_s - omega, 0.0))
+        q_minus = abs(k - kp)
+        q_plus = k + kp
+        if q_minus <= 0.0 or q_plus <= q_minus:
+            return None
+        return math.log(q_minus), math.log(q_plus), k, kp
+
+    def sample_q(self, ch, E_s, omega, rng, diag):
+        """
+        Sample q inside [q-, q+] from ELF_ch(omega, q), in log q (the variable
+        the DIIMFP was integrated over).
+
+        The CDF is built on a fresh grid spanning the kinematic window rather
+        than on whatever tabulated q points happen to fall inside it, so a
+        narrow window (small omega, high E) can no longer produce an empty
+        interval and a dropped collision.
+        """
+        bounds = self.qlog_bounds(E_s, omega)
+        if bounds is None:
+            diag["q_cdf_empty"] += 1
+            return None
+        qm_log, qp_log, k, kp = bounds
+
+        lo, hi = self._qlog_grid[0], self._qlog_grid[-1]
+        if qm_log < lo or qp_log > hi:
+            diag["q_window_clipped"] += 1
+        qm_log = max(qm_log, lo)
+        qp_log = min(qp_log, hi)
+        if qp_log <= qm_log:
+            diag["q_cdf_empty"] += 1
+            return None
+
+        qlog = np.linspace(qm_log, qp_log, self.cfg.n_q_sample)
+        omega_h = omega / H2EV
+        elf = np.asarray(
+            self._elf_spl[ch].ev(np.full_like(qlog, omega_h), qlog), float
+        )
+        elf = np.nan_to_num(elf, nan=0.0, posinf=0.0, neginf=0.0)
+        elf[elf < 0.0] = 0.0
+
+        cdf = cumtrapz_numpy(elf, qlog)
+        total = float(cdf[-1])
+        if total <= 0.0 or not np.isfinite(total):
+            diag["q_cdf_empty"] += 1
+            return None
+
+        q = math.exp(_invert_cdf(cdf / total, qlog, rng.random()))
+        # Guaranteed by construction, but this is the invariant that the old
+        # code violated silently through the acos() clamp.
+        q = min(max(q, abs(k - kp)), k + kp)
+        return q, k, kp
+
+    # ------------------------------------------------------------------
+    # Free-electron-gas target sampling
+    # ------------------------------------------------------------------
+    def sample_target_electron(self, omega, q_a0inv, rng, diag):
+        """
+        Sample the initial state of the struck electron for a single-particle
+        (channel 'se') excitation of a free electron gas.
+
+        Works in a local frame with z || q, all in Hartree atomic units:
+            omega = (q^2 + 2 k_z q)/2   ->   k_z = (2 omega - q^2)/(2 q)
+        with |k| <= k_F (occupied) and |k + q| >= k_F (Pauli blocking).
+        The allowed set is an annulus in the k_z plane; sampling uniformly in
+        area is the correct weight because the FEG matrix element does not
+        depend on k.
+
+        Returns (k_perp, k_z) in a0^-1, or None if the state is blocked.
+        """
+        if q_a0inv <= 0.0:
+            return None
+        omega_h = omega / H2EV
+        kF = self.k_fermi_feg
+        q = float(q_a0inv)
+
+        kz = (2.0 * omega_h - q * q) / (2.0 * q)
+
+        r_out_sq = kF * kF - kz * kz
+        if r_out_sq <= 0.0:
+            diag["se_blocked_pauli"] += 1
+            return None
+        r_out = math.sqrt(r_out_sq)
+
+        r_in_sq = kF * kF - (kz + q) * (kz + q)
+        r_in = math.sqrt(r_in_sq) if r_in_sq > 0.0 else 0.0
+        if r_in >= r_out:
+            diag["se_blocked_pauli"] += 1
+            return None
+
+        u = rng.random()
+        r = math.sqrt(r_in * r_in + u * (r_out * r_out - r_in * r_in))
+        return r, kz
+
+    def sample_plasmon_target_energy(self, omega, rng):
+        """
+        Initial energy of the electron promoted by plasmon decay, drawn from
+        the free-electron joint density of states  ~ sqrt(E (E + omega))  on
+        [0, E_F].  Rejection sampling (the old code rebuilt a 400-point
+        trapezoid CDF on every single plasmon event).
+        """
+        e_ref = self.e_fermi_feg if self.is_metal else self.e_vb
+        e_ref = max(e_ref, 1e-6)
+        f_max = math.sqrt(e_ref * (e_ref + omega))
+        if f_max <= 0.0:
+            return 0.0
+        for _ in range(200):
+            e = rng.random() * e_ref
+            if rng.random() * f_max <= math.sqrt(e * (e + omega)):
+                return e
+        return 0.5 * e_ref
+
+
+# --------------------------------------------------------------------------
+# Electron
+# --------------------------------------------------------------------------
+Vec3 = Tuple[float, float, float]
+
+
+def _vec3(values) -> Vec3:
+    """Store directions and positions as immutable, serialization-safe triples."""
+    return tuple(float(v) for v in values)
+
+
+def _dot3(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+@dataclass
+class HistoryEvent:
+    """One raw transport event; population labels are intentionally absent."""
+
+    event_id: int
+    electron_id: int
+    kind: str
+    position: Vec3
+    energy_before: float
+    energy_after: float
+    direction_before: Vec3
+    direction_after: Vec3
+    step_length: float = 0.0
+    scattering_angle: Optional[float] = None
+    azimuth: Optional[float] = None
+    energy_loss: Optional[float] = None
+    momentum_transfer: Optional[float] = None
+    sampled_channel: Optional[str] = None
+    mechanism: Optional[str] = None
+    child_id: Optional[int] = None
+    outcome: Optional[str] = None
+    surface_id: Optional[str] = None
+    surface_normal: Optional[Vec3] = None
+    region_from: Optional[str] = None
+    region_to: Optional[str] = None
+    primitive_id: Optional[int] = None
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class ElectronRecord:
+    """Ancestry, birth state, accumulated history, and final fate of one electron."""
+
+    electron_id: int
+    parent_id: Optional[int]
+    root_primary_id: int
+    generation: int
+    is_primary: bool
+    birth_event_id: int
+    birth_position: Vec3
+    birth_energy: float
+    birth_direction: Vec3
+    birth_mechanism: str
+    parent_energy_before: Optional[float] = None
+    parent_energy_after: Optional[float] = None
+    parent_direction_before: Optional[Vec3] = None
+    parent_direction_after: Optional[Vec3] = None
+    sampled_channel: Optional[str] = None
+    elastic_events: int = 0
+    inelastic_events: int = 0
+    surface_encounters: int = 0
+    internal_reflections: int = 0
+    first_beam_reversal_event_id: Optional[int] = None
+    first_beam_reversal_kind: Optional[str] = None
+    first_surface_return_event_id: Optional[int] = None
+    first_surface_return_kind: Optional[str] = None
+    maximum_depth: float = 0.0
+    maximum_lateral_distance: float = 0.0
+    path_length: float = 0.0
+    fate: Optional[str] = None
+    final_position: Optional[Vec3] = None
+    final_energy: Optional[float] = None
+    final_direction: Optional[Vec3] = None
+
+
+@dataclass
+class TrajectoryHistory:
+    """Complete provenance for one incident primary and its cascade."""
+
+    incident_energy: float
+    incident_angle: float
+    incident_direction: Vec3
+    launch_position: Vec3
+    trajectory_id: Optional[int] = None
+    electrons: list = field(default_factory=list)
+    events: list = field(default_factory=list)
+
+    def events_for(self, electron_id: int):
+        return [e for e in self.events if e.electron_id == electron_id]
+
+    def ancestry(self, electron_id: int):
+        """Return records from the root primary through ``electron_id``."""
+        by_id = {r.electron_id: r for r in self.electrons}
+        chain = []
+        current = by_id[electron_id]
+        while True:
+            chain.append(current)
+            if current.parent_id is None:
+                break
+            current = by_id[current.parent_id]
+        return list(reversed(chain))
+
+    def event_rows(self):
+        return [asdict(event) for event in self.events]
+
+    def electron_rows(self):
+        return [asdict(record) for record in self.electrons]
+
+    def to_dict(self):
+        return {
+            "incident_energy": self.incident_energy,
+            "incident_angle": self.incident_angle,
+            "incident_direction": self.incident_direction,
+            "launch_position": self.launch_position,
+            "trajectory_id": self.trajectory_id,
+            "electrons": self.electron_rows(),
+            "events": self.event_rows(),
+        }
+
+
+@dataclass
+class Secondary:
+    """A secondary electron requested by an inelastic collision."""
+    energy: float               # E_s, VB-bottom referenced
+    uvw: list
+    xyz: list
+    generation: int
+    mechanism: str = "unknown"
+    sampled_channel: Optional[str] = None
+    parent_energy_before: Optional[float] = None
+    parent_energy_after: Optional[float] = None
+    parent_direction_before: Optional[Vec3] = None
+    parent_direction_after: Optional[Vec3] = None
+    creation_event_id: Optional[int] = None
+
+
+@dataclass
+class Emission:
+    """Record of one electron leaving the surface."""
+    energy: float               # vacuum kinetic energy, eV
+    uz: float                   # direction cosine w.r.t. local outward normal
+    is_cascade: bool            # born in the cascade (vs. the incident electron)
+    generation: int
+    birth_depth: float
+    electron_id: int = -1
+    parent_id: Optional[int] = None
+    root_primary_id: int = -1
+    xyz: Optional[Vec3] = None
+    uvw: Optional[Vec3] = None
+    surface_id: Optional[str] = None
+    surface_normal: Optional[Vec3] = None
+    region_from: Optional[str] = None
+    region_to: Optional[str] = None
+    primitive_id: Optional[int] = None
+
+
+class _HistoryRecorder:
+    """Internal append-only recorder.  It never samples RNG or changes transport."""
+
+    def __init__(self, incident_direction, incident_energy, incident_angle,
+                 launch_position=(0.0, 0.0, 0.0), trajectory_id=None,
+                 geometry=None, reference_surface_normal=(0.0, 0.0, -1.0)):
+        self.history = TrajectoryHistory(
+            incident_energy=float(incident_energy),
+            incident_angle=float(incident_angle),
+            incident_direction=_vec3(incident_direction),
+            launch_position=_vec3(launch_position),
+            trajectory_id=trajectory_id,
+        )
+        self._next_electron_id = 0
+        self._next_event_id = 0
+        self._events_by_id = {}
+        self.geometry = geometry
+        self.reference_surface_normal = _vec3(reference_surface_normal)
+
+    def _event(self, **kwargs):
+        event = HistoryEvent(event_id=self._next_event_id, **kwargs)
+        self._next_event_id += 1
+        self.history.events.append(event)
+        self._events_by_id[event.event_id] = event
+        return event
+
+    def _observe(self, record, position):
+        xyz = _vec3(position)
+        if hasattr(self.geometry, "depth_into_solid"):
+            depth = self.geometry.depth_into_solid(xyz)
+        else:
+            depth = max(xyz[2], 0.0)
+        record.maximum_depth = max(record.maximum_depth, depth)
+        if hasattr(self.geometry, "lateral_distance"):
+            lateral = self.geometry.lateral_distance(
+                xyz, self.history.launch_position
+            )
+        else:
+            dx = xyz[0] - self.history.launch_position[0]
+            dy = xyz[1] - self.history.launch_position[1]
+            lateral = math.hypot(dx, dy)
+        record.maximum_lateral_distance = max(
+            record.maximum_lateral_distance, lateral
+        )
+
+    def _record_for(self, electron_id):
+        return self.history.electrons[electron_id]
+
+    def register_primary(self, energy, position, direction):
+        electron_id = self._next_electron_id
+        self._next_electron_id += 1
+        event = self._event(
+            electron_id=electron_id,
+            kind="primary_launch",
+            position=_vec3(position),
+            energy_before=float(energy),
+            energy_after=float(energy),
+            direction_before=_vec3(direction),
+            direction_after=_vec3(direction),
+            outcome="queued",
+        )
+        record = ElectronRecord(
+            electron_id=electron_id,
+            parent_id=None,
+            root_primary_id=electron_id,
+            generation=0,
+            is_primary=True,
+            birth_event_id=event.event_id,
+            birth_position=_vec3(position),
+            birth_energy=float(energy),
+            birth_direction=_vec3(direction),
+            birth_mechanism="incident_primary",
+            maximum_depth=(
+                self.geometry.depth_into_solid(position)
+                if hasattr(self.geometry, "depth_into_solid")
+                else max(float(position[2]), 0.0)
+            ),
+        )
+        self.history.electrons.append(record)
+        self._observe(record, position)
+        return electron_id
+
+    def register_secondary(self, parent, secondary):
+        electron_id = self._next_electron_id
+        self._next_electron_id += 1
+        root_id = parent.root_primary_id
+        event = self._event(
+            electron_id=electron_id,
+            kind="secondary_birth",
+            position=_vec3(secondary.xyz),
+            energy_before=float(secondary.energy),
+            energy_after=float(secondary.energy),
+            direction_before=_vec3(secondary.uvw),
+            direction_after=_vec3(secondary.uvw),
+            sampled_channel=secondary.sampled_channel,
+            mechanism=secondary.mechanism,
+            outcome="created",
+            metadata={"parent_id": parent.electron_id},
+        )
+        record = ElectronRecord(
+            electron_id=electron_id,
+            parent_id=parent.electron_id,
+            root_primary_id=root_id,
+            generation=secondary.generation,
+            is_primary=False,
+            birth_event_id=event.event_id,
+            birth_position=_vec3(secondary.xyz),
+            birth_energy=float(secondary.energy),
+            birth_direction=_vec3(secondary.uvw),
+            birth_mechanism=secondary.mechanism,
+            parent_energy_before=secondary.parent_energy_before,
+            parent_energy_after=secondary.parent_energy_after,
+            parent_direction_before=secondary.parent_direction_before,
+            parent_direction_after=secondary.parent_direction_after,
+            sampled_channel=secondary.sampled_channel,
+            maximum_depth=(
+                self.geometry.depth_into_solid(secondary.xyz)
+                if hasattr(self.geometry, "depth_into_solid")
+                else max(float(secondary.xyz[2]), 0.0)
+            ),
+        )
+        self.history.electrons.append(record)
+        self._observe(record, secondary.xyz)
+        if secondary.creation_event_id is not None:
+            collision = self._events_by_id[secondary.creation_event_id]
+            collision.child_id = electron_id
+        return electron_id
+
+    def record_collision(self, electron, kind, position, energy_before,
+                         direction_before, scattering_angle, azimuth,
+                         *, energy_loss=None, momentum_transfer=None,
+                         sampled_channel=None, mechanism=None):
+        event = self._event(
+            electron_id=electron.electron_id,
+            kind=kind,
+            position=_vec3(position),
+            energy_before=float(energy_before),
+            energy_after=float(electron.energy),
+            direction_before=_vec3(direction_before),
+            direction_after=_vec3(electron.uvw),
+            step_length=float(electron.last_step_length),
+            scattering_angle=float(scattering_angle),
+            azimuth=float(azimuth),
+            energy_loss=None if energy_loss is None else float(energy_loss),
+            momentum_transfer=(None if momentum_transfer is None
+                               else float(momentum_transfer)),
+            sampled_channel=sampled_channel,
+            mechanism=mechanism,
+            outcome="completed",
+        )
+        record = self._record_for(electron.electron_id)
+        if kind == "elastic":
+            record.elastic_events += 1
+        else:
+            record.inelastic_events += 1
+        self._observe(record, position)
+        self._detect_returns(record, event)
+        return event.event_id
+
+    def _detect_returns(self, record, event):
+        beam = self.history.incident_direction
+        before_beam = _dot3(event.direction_before, beam)
+        after_beam = _dot3(event.direction_after, beam)
+        if (record.first_beam_reversal_event_id is None
+                and before_beam > 0.0 and after_beam <= 0.0):
+            record.first_beam_reversal_event_id = event.event_id
+            record.first_beam_reversal_kind = event.kind
+
+        normal = self.reference_surface_normal
+        before_surface = _dot3(event.direction_before, normal)
+        after_surface = _dot3(event.direction_after, normal)
+        if (record.first_surface_return_event_id is None
+                and before_surface <= 0.0 and after_surface > 0.0):
+            record.first_surface_return_event_id = event.event_id
+            record.first_surface_return_kind = event.kind
+
+    def record_surface(self, electron, escaped, energy_before, direction_before):
+        kind = "emission" if escaped else "surface_reflection"
+        hit = electron.last_surface_hit
+        event = self._event(
+            electron_id=electron.electron_id,
+            kind=kind,
+            position=_vec3(electron.xyz),
+            energy_before=float(energy_before),
+            energy_after=float(electron.energy),
+            direction_before=_vec3(direction_before),
+            direction_after=_vec3(electron.uvw),
+            step_length=float(electron.last_step_length),
+            outcome="escaped" if escaped else "reflected",
+            surface_id=None if hit is None else hit.surface_id,
+            surface_normal=None if hit is None else _vec3(hit.normal),
+            region_from=None if hit is None else hit.region_from,
+            region_to=None if hit is None else hit.region_to,
+            primitive_id=None if hit is None else hit.primitive_id,
+        )
+        record = self._record_for(electron.electron_id)
+        record.surface_encounters += 1
+        if not escaped:
+            record.internal_reflections += 1
+        self._observe(record, electron.xyz)
+        return event.event_id
+
+    def finalize_untransported(self, electron_id, fate):
+        record = self._record_for(electron_id)
+        record.fate = fate
+        record.final_position = record.birth_position
+        record.final_energy = record.birth_energy
+        record.final_direction = record.birth_direction
+        self._event(
+            electron_id=electron_id,
+            kind="termination",
+            position=record.birth_position,
+            energy_before=record.birth_energy,
+            energy_after=record.birth_energy,
+            direction_before=record.birth_direction,
+            direction_after=record.birth_direction,
+            outcome=fate,
+        )
+
+    def finalize_electron(self, electron):
+        record = self._record_for(electron.electron_id)
+        record.path_length = float(electron.path_length)
+        record.fate = electron.fate or ("emitted" if not electron.inside else "terminated")
+        record.final_position = _vec3(electron.xyz)
+        record.final_energy = float(electron.energy)
+        record.final_direction = _vec3(electron.uvw)
+        self._observe(record, electron.xyz)
+        if record.fate != "emitted":
+            self._event(
+                electron_id=electron.electron_id,
+                kind="termination",
+                position=record.final_position,
+                energy_before=record.final_energy,
+                energy_after=record.final_energy,
+                direction_before=record.final_direction,
+                direction_after=record.final_direction,
+                outcome=record.fate,
+            )
+
+
+class Electron:
+    """
+    One electron.  `energy` is always E_s (VB-bottom referenced) while inside
+    the solid, and becomes the vacuum kinetic energy after emission.
+    """
+
+    def __init__(self, sample: Sample, energy, xyz, uvw, generation=0,
+                 is_cascade=False, rng=None, save_coordinates=False,
+                 electron_id=-1, parent_id=None, root_primary_id=None,
+                 history=None, geometry=None, current_region=None):
+        self.sample = sample
+        self.cfg = sample.cfg
+        self.rng = rng
+
+        self.energy = float(energy)
+        self.initial_energy = self.energy
+        self.xyz = [float(v) for v in xyz]
+        self.uvw = [float(v) for v in uvw]
+        self.geometry = _REFERENCE_PLANE if geometry is None else geometry
+        if not isinstance(self.geometry, Geometry):
+            raise TypeError(
+                "geometry must provide first_hit() and region_at()"
+            )
+        self.current_region = (
+            self.geometry.region_at(self.xyz)
+            if current_region is None else str(current_region)
+        )
+        self.generation = int(generation)
+        self.is_cascade = bool(is_cascade)
+        self.birth_depth = (
+            self.geometry.depth_into_solid(self.xyz)
+            if hasattr(self.geometry, "depth_into_solid")
+            else self.xyz[2]
+        )
+        self.electron_id = int(electron_id)
+        self.parent_id = parent_id
+        self.root_primary_id = (
+            self.electron_id if root_primary_id is None else int(root_primary_id)
+        )
+        self.history = history
+
+        self.inside = True
+        self.dead = False
+        self.fate = None
+        self.path_length = 0.0
+        self.last_step_length = 0.0
+        self.last_surface_hit = None
+        self.save_coordinates = bool(save_coordinates)
+        self.coordinates = []
+        self._record()
+
+        self.Ui = sample.Ui
+        self.e_fermi = sample.e_fermi
+        self._inv_e, self._inv_i = sample.inverse_mfps(self.energy)
+
+    # -- convenience ---------------------------------------------------
+    def _record(self):
+        if self.save_coordinates:
+            self.coordinates.append([round(v, 3) for v in self.xyz] + [round(self.energy, 3)])
+
+    def refresh_rates(self):
+        """Evaluate the inverse MFPs once per step and cache them."""
+        self._inv_e, self._inv_i = self.sample.inverse_mfps(self.energy)
+        return self._inv_e + self._inv_i
+
+    @property
+    def iemfp(self):
+        return self.sample.inverse_mfps(self.energy)[0]
+
+    @property
+    def iimfp(self):
+        return self.sample.inverse_mfps(self.energy)[1]
+
+    @property
+    def itmfp(self):
+        inv_e, inv_i = self.sample.inverse_mfps(self.energy)
+        return inv_e + inv_i
+
+    def check_alive(self):
+        """
+        Called at the TOP of every transport step (the old code only checked
+        after an inelastic loss, which let a sub-barrier electron in a
+        non-metal scatter elastically forever).
+        """
+        if (not np.isfinite(self.energy)) or self.energy <= 0.0:
+            self.dead = True
+            self.fate = "invalid_energy"
+            return
+        if self.inside and self.energy <= self.Ui and not self.cfg.track_subbarrier:
+            # Cannot escape a step barrier and cannot gain energy: terminal.
+            self.dead = True
+            self.fate = "absorbed_below_barrier"
+
+    # -- transport -----------------------------------------------------
+    def travel(self):
+        """
+        Advance one free path.  Returns True if the step was truncated by the
+        nearest geometry interface, in which case NO collision may be
+        processed for this step.
+        """
+        rate = self.refresh_rates()
+        if (not np.isfinite(rate)) or rate <= 0.0:
+            self.dead = True
+            self.fate = "no_scattering_rate"
+            self.last_step_length = 0.0
+            return False
+
+        s = -math.log(max(self.rng.random(), 1e-300)) / rate
+        self.last_surface_hit = self.geometry.first_hit(
+            self.xyz, self.uvw, s, self.current_region
+        )
+        hit_surface = self.last_surface_hit is not None
+        if hit_surface:
+            s = self.last_surface_hit.distance
+
+        self.path_length += s
+        self.last_step_length = s
+        self.xyz[0] += self.uvw[0] * s
+        self.xyz[1] += self.uvw[1] * s
+        self.xyz[2] += self.uvw[2] * s
+        if hit_surface:
+            self.xyz[:] = self.last_surface_hit.position
+        self._record()
+        return hit_surface
+
+    def _hit_for_direct_escape(self):
+        """Construct the plane hit needed by legacy direct ``escape()`` calls."""
+        if self.last_surface_hit is not None:
+            return self.last_surface_hit
+        if not isinstance(self.geometry, Plane):
+            raise RuntimeError("escape() requires a preceding geometry hit")
+        if self.current_region != self.geometry.solid_region:
+            raise RuntimeError("escape() can only leave the solid region")
+        hit = SurfaceHit(
+            distance=0.0,
+            position=_vec3(self.xyz),
+            normal=self.geometry.outward_normal,
+            surface_id=self.geometry.surface_id,
+            region_from=self.geometry.solid_region,
+            region_to=self.geometry.vacuum_region,
+            primitive_id=0,
+        )
+        self.last_surface_hit = hit
+        return hit
+
+    def escape(self):
+        """
+        Attempt to cross the local planar step barrier of height U_i.
+        Returns True if the electron left the solid; otherwise it has been
+        specularly reflected and stays inside.
+        """
+        hit = self._hit_for_direct_escape()
+        Es = self.energy
+        ux, uy, uz = self.uvw
+        normal = hit.normal
+        outward_cosine = _dot3(self.uvw, normal)
+
+        E_perp = Es * outward_cosine * outward_cosine
+        if outward_cosine <= 0.0 or Es <= self.Ui or E_perp <= self.Ui:
+            self._reflect(hit)
+            return False
+
+        T = barrier_transmission(E_perp, self.Ui, self.cfg)
+        if T < 1.0 and self.rng.random() >= T:
+            self._reflect(hit)
+            return False
+
+        Ev = Es - self.Ui
+        # Parallel momentum is conserved; E_perp > U_i already guarantees a
+        # real outgoing normal component, so no separate
+        # total-internal-reflection test.
+        scale = math.sqrt(Es / Ev)
+
+        if normal == (0.0, 0.0, -1.0):
+            # Exact arithmetic of the validated z=0 implementation.
+            ux_out = ux * scale
+            uy_out = uy * scale
+            uz_out = -math.sqrt(
+                max(1.0 - (ux_out * ux_out + uy_out * uy_out), 0.0)
+            )
+            outgoing = [ux_out, uy_out, uz_out]
+        else:
+            tangent = [
+                self.uvw[index] - outward_cosine * normal[index]
+                for index in range(3)
+            ]
+            tangent_out = [value * scale for value in tangent]
+            tangent_sq = _dot3(tangent_out, tangent_out)
+            normal_out = math.sqrt(max(1.0 - tangent_sq, 0.0))
+            outgoing = [
+                tangent_out[index] + normal_out * normal[index]
+                for index in range(3)
+            ]
+
+        self.inside = False
+        self.fate = "emitted"
+        self.current_region = hit.region_to
+        self.uvw = outgoing
+        self.energy = Ev
+        self.xyz[:] = hit.position
+        self._record()
+        return True
+
+    def _reflect(self, hit=None):
+        hit = self._hit_for_direct_escape() if hit is None else hit
+        normal = hit.normal
+        if normal == (0.0, 0.0, -1.0):
+            self.uvw[2] = abs(self.uvw[2])
+        else:
+            normal_component = _dot3(self.uvw, normal)
+            self.uvw = [
+                self.uvw[index] - 2.0 * normal_component * normal[index]
+                for index in range(3)
+            ]
+        self.xyz[:] = hit.position
+        self._record()
+
+    # -- collisions ----------------------------------------------------
+    def choose_scattering_type(self):
+        # Reuses the rates computed by travel() for this very step: the
+        # branching ratio must be the one that generated the free path.
+        inv_e, inv_i = self._inv_e, self._inv_i
+        total = inv_e + inv_i
+        if total <= 0.0 or not np.isfinite(total):
+            self.dead = True
+            self.fate = "no_scattering_rate"
+            return None
+        return "elastic" if (self.rng.random() < inv_e / total) else "inelastic"
+
+    def scatter(self, diag):
+        """
+        Perform one collision.  Returns a `Secondary` to be queued, or None.
+        All per-collision state is local: nothing can leak into the next event.
+        """
+        kind = self.choose_scattering_type()
+        if kind is None:
+            return None
+
+        if kind == "elastic":
+            diag["elastic_events"] += 1
+            energy_before = self.energy
+            uvw_before = list(self.uvw)
+            theta = self.sample.sample_elastic_theta(self.energy, self.rng)
+            phi = 2.0 * math.pi * self.rng.random()
+            self.uvw = rotate_direction(self.uvw, theta, phi)
+            if self.history is not None:
+                self.history.record_collision(
+                    self, "elastic", self.xyz, energy_before, uvw_before,
+                    theta, phi,
+                )
+            return None
+
+        return self._inelastic(diag)
+
+    def _inelastic(self, diag):
+        smp = self.sample
+        rng = self.rng
+
+        ch = smp.choose_channel(self.energy, rng)
+        if ch is None:
+            return None
+        sampled_channel = ch
+
+        omega = smp.sample_energy_loss(ch, self.energy, rng, diag)
+        if omega is None:
+            return None
+
+        qres = smp.sample_q(ch, self.energy, omega, rng, diag)
+        if qres is None:
+            return None
+        q, k, kp = qres
+
+        diag["inelastic_events"] += 1
+
+        # Mao Eq. (9): the SE MECHANISM is decided by where (omega, q) sits
+        # relative to the single-electron-excitation window, NOT by which
+        # table the pair happened to be drawn from.  The transport (energy
+        # loss, deflection) is unaffected because the tables sum to the total;
+        # only the secondary-electron construction changes.
+        if self.cfg.se_channel_rule == "mao":
+            q_minus, q_plus = smp.mao_q_boundaries(omega)
+            mech = "se" if (q_minus <= q <= q_plus) else "pl"
+            if mech != ch:
+                diag["channel_reclassified"] += 1
+            ch = mech
+
+        # --- projectile deflection (relativistic momenta, same as the bounds)
+        cos_theta_p = (k * k + kp * kp - q * q) / (2.0 * k * kp)
+        cos_theta_p = min(1.0, max(-1.0, cos_theta_p))
+        theta_p = math.acos(cos_theta_p)
+        phi_p = 2.0 * math.pi * rng.random()
+
+        energy_before = self.energy
+        uvw_before = list(self.uvw)          # <-- the SE frame, captured BEFORE rotating
+        self.uvw = rotate_direction(uvw_before, theta_p, phi_p)
+        self.energy -= omega
+        self._record()
+
+        # --- secondary electron
+        if ch == "se":
+            secondary = self._secondary_from_binary_encounter(
+                uvw_before, theta_p, phi_p, omega, q, k, kp, diag,
+                sampled_channel, energy_before,
+            )
+        else:
+            secondary = self._secondary_from_plasmon(
+                uvw_before, theta_p, phi_p, omega, q, k, kp, diag,
+                sampled_channel=sampled_channel,
+                parent_energy_before=energy_before,
+            )
+
+        if self.history is not None:
+            mechanism = secondary.mechanism if secondary is not None else "binary_dropped"
+            event_id = self.history.record_collision(
+                self, "inelastic", self.xyz, energy_before, uvw_before,
+                theta_p, phi_p, energy_loss=omega, momentum_transfer=q,
+                sampled_channel=sampled_channel, mechanism=mechanism,
+            )
+            if secondary is not None:
+                secondary.creation_event_id = event_id
+        return secondary
+
+    # -- secondary construction ---------------------------------------
+    def _q_hat(self, uvw_before, theta_p, phi_p, k, kp):
+        """
+        Unit vector along the momentum transfer q = k - k'.
+
+        In the frame with z || k:
+            q_perp = k' sin(theta_p),  q_z = k - k' cos(theta_p),  azimuth = phi_p + pi
+        """
+        theta_q = math.atan2(kp * math.sin(theta_p), k - kp * math.cos(theta_p))
+        return rotate_direction(uvw_before, theta_q, (phi_p + math.pi) % (2.0 * math.pi))
+
+    def _secondary_from_binary_encounter(self, uvw_before, theta_p, phi_p,
+                                         omega, q, k, kp, diag,
+                                         sampled_channel, parent_energy_before):
+        smp = self.sample
+        target = smp.sample_target_electron(omega, q, self.rng, diag)
+        if target is None:
+            if self.cfg.on_pauli_block == "drop":
+                return None
+            # The ELF said this (omega, q) carries single-particle strength but
+            # the FEG kinematics say no state is available -- i.e. the model
+            # used to disperse the ELF and the model used here disagree.
+            # Dropping the secondary would destroy the excitation while keeping
+            # the energy loss, so fall back to the DOS construction instead.
+            diag["se_pauli_fallback"] += 1
+            return self._secondary_from_plasmon(
+                uvw_before, theta_p, phi_p, omega, q, k, kp, diag,
+                mechanism="binary_pauli_fallback",
+                sampled_channel=sampled_channel,
+                parent_energy_before=parent_energy_before,
+            )
+        r, kz = target
+
+        # Final state of the struck electron, in the frame with z || q:
+        #   k_f = k_i + q z_hat   ->   E_f = E_i + omega  exactly.
+        kfz = kz + q
+        E_se = 0.5 * (r * r + kfz * kfz) * H2EV
+
+        if self.cfg.se_direction_model == "isotropic":
+            uvw = _isotropic_direction(self.rng)
+        else:
+            q_hat = self._q_hat(uvw_before, theta_p, phi_p, k, kp)
+            psi = 2.0 * math.pi * self.rng.random()      # azimuth about q
+            theta_f = math.atan2(r, kfz)
+            uvw = rotate_direction(q_hat, theta_f, psi)
+
+        return Secondary(
+            E_se, uvw, list(self.xyz), self.generation + 1,
+            mechanism="binary",
+            sampled_channel=sampled_channel,
+            parent_energy_before=float(parent_energy_before),
+            parent_energy_after=float(self.energy),
+            parent_direction_before=_vec3(uvw_before),
+            parent_direction_after=_vec3(self.uvw),
+        )
+
+    def _secondary_from_plasmon(self, uvw_before, theta_p, phi_p,
+                                omega, q, k, kp, diag, *, mechanism="plasmon",
+                                sampled_channel=None, parent_energy_before=None):
+        """
+        Plasmon decay.  The plasmon carries q << k_F and decays by Landau
+        damping at a wavevector uncorrelated with the incident direction, so
+        the emitted direction is taken isotropic by default; the initial state
+        is drawn from the free-electron joint DOS.
+        """
+        E_i = self.sample.sample_plasmon_target_energy(omega, self.rng)
+        E_se = E_i + omega
+
+        if self.cfg.plasmon_se_direction == "isotropic":
+            uvw = _isotropic_direction(self.rng)
+        else:
+            q_hat = self._q_hat(uvw_before, theta_p, phi_p, k, kp)
+            k_i = math.sqrt(max(2.0 * E_i / H2EV, 0.0))
+            mu = 2.0 * self.rng.random() - 1.0
+            kz = k_i * mu + q
+            r = k_i * math.sqrt(max(1.0 - mu * mu, 0.0))
+            psi = 2.0 * math.pi * self.rng.random()
+            uvw = rotate_direction(q_hat, math.atan2(r, kz), psi)
+
+        return Secondary(
+            E_se, uvw, list(self.xyz), self.generation + 1,
+            mechanism=mechanism,
+            sampled_channel=sampled_channel,
+            parent_energy_before=(None if parent_energy_before is None
+                                  else float(parent_energy_before)),
+            parent_energy_after=float(self.energy),
+            parent_direction_before=_vec3(uvw_before),
+            parent_direction_after=_vec3(self.uvw),
+        )
+
+
+# --------------------------------------------------------------------------
+# Trajectory  (ONE implementation, shared by the serial and parallel paths)
+# --------------------------------------------------------------------------
+@dataclass
+class TrajectoryResult:
+    tey: int = 0
+    sey_cascade: int = 0        # split by "was born in the cascade"
+    bse_cascade: int = 0
+    sey_50ev: int = 0           # split by the conventional 50 eV emission cut
+    bse_50ev: int = 0
+    emissions: list = field(default_factory=list)
+    birth_depths: list = field(default_factory=list)
+    tracks: list = field(default_factory=list)
+    diagnostics: Diagnostics = field(default_factory=Diagnostics)
+    history: Optional[TrajectoryHistory] = None
+
+
+def incident_direction(E0, sample: Sample, angle_rad,
+                       surface_normal=(0.0, 0.0, -1.0), azimuth_rad=0.0):
+    """
+    Direction of the primary just inside the surface.
+
+    The barrier accelerates the electron from E0 to E_s = E0 + U_i while
+    conserving parallel momentum, so it is refracted towards the normal:
+
+        sin(theta_solid) = sqrt(E0 / E_s) * sin(theta_vacuum)
+
+    The previous version added U_i to the energy but kept the vacuum angle,
+    which only agrees at normal incidence.
+
+    ``surface_normal`` points out of the solid.  At zero azimuth the
+    tangential component follows the projection of global +x onto the plane;
+    the default plane therefore retains exactly ``[sin(theta), 0, cos(theta)]``.
+    """
+    E_s = E0 + sample.Ui
+    sin_in = math.sqrt(max(E0, 0.0) / E_s) * math.sin(angle_rad)
+    sin_in = min(sin_in, 1.0)
+    cos_in = math.sqrt(max(1.0 - sin_in * sin_in, 0.0))
+    normal = _vec3(surface_normal)
+    normal_length = math.sqrt(_dot3(normal, normal))
+    if normal_length == 0.0 or not math.isfinite(normal_length):
+        raise ValueError("surface_normal must be a finite non-zero vector")
+    normal = tuple(value / normal_length for value in normal)
+    azimuth_rad = float(azimuth_rad)
+
+    if normal == (0.0, 0.0, -1.0) and azimuth_rad == 0.0:
+        return E_s, [sin_in, 0.0, cos_in]
+
+    inward = tuple(-value for value in normal)
+    reference = (1.0, 0.0, 0.0)
+    projection = _dot3(reference, inward)
+    tangent_x = tuple(
+        reference[index] - projection * inward[index]
+        for index in range(3)
+    )
+    tangent_length = math.sqrt(_dot3(tangent_x, tangent_x))
+    if tangent_length < 1e-14:
+        reference = (0.0, 1.0, 0.0)
+        projection = _dot3(reference, inward)
+        tangent_x = tuple(
+            reference[index] - projection * inward[index]
+            for index in range(3)
+        )
+        tangent_length = math.sqrt(_dot3(tangent_x, tangent_x))
+    tangent_x = tuple(value / tangent_length for value in tangent_x)
+    tangent_y = (
+        inward[1] * tangent_x[2] - inward[2] * tangent_x[1],
+        inward[2] * tangent_x[0] - inward[0] * tangent_x[2],
+        inward[0] * tangent_x[1] - inward[1] * tangent_x[0],
+    )
+    ca = math.cos(azimuth_rad)
+    sa = math.sin(azimuth_rad)
+    tangent = tuple(
+        ca * tangent_x[index] + sa * tangent_y[index]
+        for index in range(3)
+    )
+    direction = [
+        sin_in * tangent[index] + cos_in * inward[index]
+        for index in range(3)
+    ]
+    direction_length = math.sqrt(_dot3(direction, direction))
+    return E_s, [value / direction_length for value in direction]
+
+
+def simulate_trajectory(sample: Sample, E0, angle_rad, rng, track=False,
+                        history=False, trajectory_id=None, geometry=None,
+                        launch_position=None, azimuth_rad=0.0):
+    """Transport one primary and its cascade, optionally recording provenance."""
+    cfg = sample.cfg
+    res = TrajectoryResult()
+    diag = res.diagnostics
+
+    geometry = _REFERENCE_PLANE if geometry is None else geometry
+    if not isinstance(geometry, Geometry):
+        raise TypeError("geometry must provide first_hit() and region_at()")
+    if launch_position is None:
+        launch_position = geometry.point if isinstance(geometry, Plane) \
+            else (0.0, 0.0, 0.0)
+    launch_position = [float(value) for value in launch_position]
+    surface_normal = geometry.outward_normal if isinstance(geometry, Plane) \
+        else (0.0, 0.0, -1.0)
+    initial_region = geometry.region_at(launch_position)
+
+    E_s, uvw0 = incident_direction(
+        float(E0), sample, angle_rad,
+        surface_normal=surface_normal, azimuth_rad=azimuth_rad,
+    )
+    recorder = _HistoryRecorder(
+        uvw0, E0, angle_rad, launch_position=launch_position,
+        trajectory_id=trajectory_id, geometry=geometry,
+        reference_surface_normal=surface_normal,
+    ) if history else None
+    primary_id = recorder.register_primary(E_s, launch_position, uvw0) \
+        if recorder is not None else -1
+    queue = [Electron(sample, E_s, launch_position, uvw0,
+                      generation=0, is_cascade=False, rng=rng,
+                      save_coordinates=track, electron_id=primary_id,
+                      parent_id=None, root_primary_id=primary_id,
+                      history=recorder, geometry=geometry,
+                      current_region=initial_region)]
+
+    i = 0
+    while i < len(queue):
+        e = queue[i]
+        steps = 0
+
+        while True:
+            e.check_alive()
+            if e.dead:
+                break
+
+            steps += 1
+            if steps > cfg.max_steps_per_electron:
+                diag["step_limit_hit"] += 1
+                e.dead = True
+                e.fate = "step_limit"
+                break
+
+            hit_surface = e.travel()
+            if e.dead:
+                break
+
+            if hit_surface:
+                diag["surface_encounters"] += 1
+                energy_before_surface = e.energy
+                direction_before_surface = list(e.uvw)
+                escaped = e.escape()
+                if recorder is not None:
+                    recorder.record_surface(
+                        e, escaped, energy_before_surface,
+                        direction_before_surface,
+                    )
+                if escaped:
+                    diag["escapes"] += 1
+                    res.tey += 1
+                    if e.is_cascade:
+                        res.sey_cascade += 1
+                    else:
+                        res.bse_cascade += 1
+                    if e.energy < cfg.bse_cutoff_ev:
+                        res.sey_50ev += 1
+                    else:
+                        res.bse_50ev += 1
+                    if cfg.collect_spectra:
+                        hit = e.last_surface_hit
+                        res.emissions.append(
+                            Emission(
+                                energy=e.energy,
+                                uz=_dot3(e.uvw, hit.normal),
+                                is_cascade=e.is_cascade,
+                                generation=e.generation,
+                                birth_depth=e.birth_depth,
+                                electron_id=e.electron_id,
+                                parent_id=e.parent_id,
+                                root_primary_id=e.root_primary_id,
+                                xyz=_vec3(e.xyz),
+                                uvw=_vec3(e.uvw),
+                                surface_id=hit.surface_id,
+                                surface_normal=_vec3(hit.normal),
+                                region_from=hit.region_from,
+                                region_to=hit.region_to,
+                                primitive_id=hit.primitive_id,
+                            )
+                        )
+                    break
+                diag["internal_reflections"] += 1
+                # KEY FIX: a step truncated at the surface produced no
+                # collision.  Draw a fresh free path instead of forcing one.
+                continue
+
+            secondary = e.scatter(diag)
+            if secondary is None:
+                continue
+
+            secondary_id = recorder.register_secondary(e, secondary) \
+                if recorder is not None else -1
+
+            if secondary.generation > cfg.max_generation:
+                diag["generation_limit_hit"] += 1
+                if recorder is not None:
+                    recorder.finalize_untransported(secondary_id, "generation_limit")
+                continue
+            if len(queue) >= cfg.max_secondaries_per_trajectory:
+                if recorder is not None:
+                    recorder.finalize_untransported(secondary_id, "cascade_size_limit")
+                continue
+            if secondary.energy <= sample.Ui and not cfg.track_subbarrier:
+                # Cannot escape a step barrier; tracking it changes no yield.
+                diag["se_below_barrier"] += 1
+                if recorder is not None:
+                    recorder.finalize_untransported(
+                        secondary_id, "untracked_below_barrier"
+                    )
+                continue
+
+            diag["se_created"] += 1
+            if cfg.collect_birth_depths:
+                depth = geometry.depth_into_solid(secondary.xyz) \
+                    if hasattr(geometry, "depth_into_solid") \
+                    else secondary.xyz[2]
+                res.birth_depths.append(depth)
+            queue.append(
+                Electron(sample, secondary.energy, secondary.xyz, secondary.uvw,
+                         generation=secondary.generation, is_cascade=True,
+                         rng=rng, save_coordinates=track,
+                         electron_id=secondary_id, parent_id=e.electron_id,
+                         root_primary_id=e.root_primary_id, history=recorder,
+                         geometry=geometry, current_region=e.current_region)
+            )
+
+        if track:
+            res.tracks.append(e.coordinates)
+        if recorder is not None:
+            recorder.finalize_electron(e)
+        queue[i] = None            # release the cascade as we go
+        i += 1
+
+    if recorder is not None:
+        res.history = recorder.history
+    return res
+
+
+# --- multiprocessing plumbing --------------------------------------------
+_G = None
+
+
+def _init_worker(sample_name, db_path, config, angle_rad, track, history,
+                 geometry=None, launch_position=None, azimuth_rad=0.0):
+    global _G
+    from types import SimpleNamespace
+    _G = SimpleNamespace(
+        sample=Sample(sample_name, db_path=db_path, config=config),
+        angle=float(angle_rad),
+        track=bool(track),
+        history=bool(history),
+        geometry=_REFERENCE_PLANE if geometry is None else geometry,
+        launch_position=launch_position,
+        azimuth=float(azimuth_rad),
+    )
+
+
+def _worker_task(args):
+    E0, seed_entropy, trajectory_id = args
+    rng = np.random.default_rng(np.random.SeedSequence(seed_entropy))
+    r = simulate_trajectory(
+        _G.sample, E0, _G.angle, rng, track=_G.track,
+        history=_G.history, trajectory_id=trajectory_id,
+        geometry=_G.geometry, launch_position=_G.launch_position,
+        azimuth_rad=_G.azimuth,
+    )
+    return (r.tey, r.sey_cascade, r.bse_cascade, r.sey_50ev, r.bse_50ev,
+            r.emissions, r.tracks if _G.track else None, r.history,
+            dict(r.diagnostics))
+
+
+# --------------------------------------------------------------------------
+# Driver
+# --------------------------------------------------------------------------
+class SEEMC:
+    """
+    Yields as a function of primary energy.
+
+    `cb_ref` is accepted for backwards compatibility but is not used by the
+    transport: the previous version stored it on every Electron and never read
+    it.  Pass a `MCConfig` instead to change model options.  ``history=True``
+    retains every collision, boundary event, ancestry link, and final fate;
+    leave it off for high-statistics yield production because the records can
+    be much larger than the yield arrays.
+    """
+
+    def __init__(self, energy_array, sample_name, angle, n_traj,
+                 cb_ref=False, track=False, db_path="MaterialDatabase.pkl",
+                 config: Optional[MCConfig] = None, seed=12345,
+                 history=False, geometry=None, launch_position=None,
+                 azimuth_rad=0.0):
+        self.energy_array = np.asarray(energy_array, dtype=float)
+        self.cfg = config or MCConfig()
+        self.cfg.validate()
+        self.sample = Sample(sample_name, db_path=db_path, config=self.cfg)
+        self.n_trajectories = int(n_traj)
+        self.incident_angle = float(angle)
+        self.db_path = db_path
+        self.track_trajectories = bool(track)
+        self.collect_history = bool(history)
+        self.geometry = _REFERENCE_PLANE if geometry is None else geometry
+        if not isinstance(self.geometry, Geometry):
+            raise TypeError("geometry must provide first_hit() and region_at()")
+        self.launch_position = (
+            None if launch_position is None
+            else tuple(float(value) for value in launch_position)
+        )
+        self.incident_azimuth = float(azimuth_rad)
+        self.cb_ref = cb_ref
+        self.seed = int(seed)
+
+        n = len(self.energy_array)
+        self.tey = np.zeros(n)
+        self.sey = np.zeros(n)          # cascade-flag split (delta)
+        self.bse = np.zeros(n)
+        self.sey_50ev = np.zeros(n)     # conventional 50 eV split
+        self.bse_50ev = np.zeros(n)
+        self.tey_err = np.zeros(n)
+        self.n_completed = np.zeros(n, dtype=int)
+        self.sey_err = np.zeros(n)
+        self.bse_err = np.zeros(n)
+
+        self.emissions = [[] for _ in range(n)]
+        self.histories = [[] for _ in range(n)]
+        self.tracks = []
+        self.diagnostics = Diagnostics()
+
+    def _seed_for(self, k, traj):
+        """Deterministic, PID-independent, collision-free by construction."""
+        return [self.seed, int(k), int(traj)]
+
+    # ------------------------------------------------------------------
+    def run_simulation(self, use_parallel=False, progress=True, verbose=True):
+        """
+        Run all energies.  NOTE: `use_parallel=True` uses the 'spawn' start
+        method, so the calling code must be guarded:
+
+            if __name__ == "__main__":
+                mc.run_simulation(use_parallel=True)
+
+        Serial and parallel runs with the same `seed` give bitwise-identical
+        yields: the per-trajectory stream is SeedSequence([seed, k, traj]),
+        which does not depend on process id or completion order.
+        """
+        import time
+        t0 = time.time()
+
+        try:
+            from tqdm import tqdm
+        except ImportError:                       # pragma: no cover
+            def tqdm(x, **kw):
+                return x
+
+        n_traj = self.n_trajectories
+
+        if use_parallel:
+            import multiprocessing as mp
+            ctx = mp.get_context("spawn")
+            nproc = mp.cpu_count()
+            chunksize = max(1, n_traj // (nproc * 8))
+            pool = ctx.Pool(
+                processes=nproc,
+                initializer=_init_worker,
+                initargs=(self.sample.name, self.db_path, self.cfg,
+                          self.incident_angle, self.track_trajectories,
+                          self.collect_history, self.geometry,
+                          self.launch_position, self.incident_azimuth),
+            )
+        else:
+            pool = None
+
+        try:
+            for k, E0 in enumerate(self.energy_array):
+                acc = np.zeros(5)          # tey, sey, bse, sey50, bse50
+                acc_sq = np.zeros(5)
+                tracks_E = [] if self.track_trajectories else None
+
+                if pool is None:
+                    it = (
+                        self._run_one(E0, k, traj)
+                        for traj in range(n_traj)
+                    )
+                else:
+                    tasks = ((float(E0), self._seed_for(k, traj), traj)
+                             for traj in range(n_traj))
+                    it = pool.imap_unordered(_worker_task, tasks, chunksize=chunksize)
+
+                iterator = tqdm(it, total=n_traj, desc=f"E={E0:.1f} eV") if progress else it
+
+                n_done = 0
+                for tey, sey, bse, sey50, bse50, emis, trk, hist, diag in iterator:
+                    n_done += 1
+                    vals = np.array([tey, sey, bse, sey50, bse50], dtype=float)
+                    acc += vals
+                    acc_sq += vals * vals
+                    if self.cfg.collect_spectra:
+                        self.emissions[k].extend(emis)
+                    if self.track_trajectories and trk is not None:
+                        tracks_E.append(trk)
+                    if self.collect_history and hist is not None:
+                        self.histories[k].append(hist)
+                    self.diagnostics.add(diag)
+
+                # Normalise by the number of trajectories that ACTUALLY came
+                # back, not the number requested. If a worker dies or an
+                # iterator is short-circuited, dividing by n_traj silently
+                # reports a yield that is too low, and the standard error is
+                # computed for a sample size that was never simulated.
+                if n_done != n_traj:
+                    warnings.warn(
+                        f"E0={E0:g} eV: requested {n_traj} trajectories but "
+                        f"{n_done} completed. Statistics use {n_done}.",
+                        RuntimeWarning, stacklevel=2)
+                if n_done == 0:
+                    raise RuntimeError(f"No trajectories completed at E0={E0:g} eV")
+                self.n_completed[k] = n_done
+                mean = acc / n_done
+                var = np.maximum(acc_sq / n_done - mean ** 2, 0.0)
+                sem = np.sqrt(var / n_done)
+
+                self.tey[k], self.sey[k], self.bse[k] = mean[0], mean[1], mean[2]
+                self.sey_50ev[k], self.bse_50ev[k] = mean[3], mean[4]
+                self.tey_err[k], self.sey_err[k], self.bse_err[k] = sem[0], sem[1], sem[2]
+
+                if self.track_trajectories:
+                    self.tracks.append(tracks_E)
+                if self.collect_history:
+                    self.histories[k].sort(
+                        key=lambda h: (-1 if h.trajectory_id is None
+                                       else h.trajectory_id)
+                    )
+        finally:
+            if pool is not None:
+                pool.close()
+                pool.join()
+
+        if verbose:
+            print(f"Done in {time.time() - t0:.1f} s")
+        return self
+
+    def _run_one(self, E0, k, traj):
+        rng = np.random.default_rng(np.random.SeedSequence(self._seed_for(k, traj)))
+        r = simulate_trajectory(self.sample, float(E0), self.incident_angle,
+                                rng, track=self.track_trajectories,
+                                history=self.collect_history,
+                                trajectory_id=traj, geometry=self.geometry,
+                                launch_position=self.launch_position,
+                                azimuth_rad=self.incident_azimuth)
+        return (r.tey, r.sey_cascade, r.bse_cascade, r.sey_50ev, r.bse_50ev,
+                r.emissions, r.tracks if self.track_trajectories else None,
+                r.history, dict(r.diagnostics))
+
+    # ------------------------------------------------------------------
+    def emission_spectrum(self, k, bins=100, e_max=None):
+        """Energy distribution of emitted electrons at energy index k."""
+        e = np.array([em.energy for em in self.emissions[k]], dtype=float)
+        if e.size == 0:
+            return np.zeros(bins), np.linspace(0, 1, bins + 1)
+        e_max = e_max if e_max is not None else float(np.percentile(e, 99.5))
+        counts, edges = np.histogram(e, bins=bins, range=(0.0, e_max))
+        return counts / self.n_trajectories, edges
+
+    def summary(self):
+        lines = [f"{self.sample.name}: {self.n_trajectories} trajectories/energy "
+                 f"(completed: {self.n_completed.min()}-{self.n_completed.max()})",
+                 f"{'E0 (eV)':>9} {'TEY':>10} {'+/-':>9} "
+                 f"{'SEY(<50eV)':>11} {'BSE(>50eV)':>11}"]
+        for k, E0 in enumerate(self.energy_array):
+            lines.append(
+                f"{E0:9.1f} {self.tey[k]:10.4f} {self.tey_err[k]:9.4f} "
+                f"{self.sey_50ev[k]:11.4f} {self.bse_50ev[k]:11.4f}"
+            )
+        lines.append("")
+        lines.append(self.diagnostics.report(self.n_trajectories * len(self.energy_array)))
+        return "\n".join(lines)
+
+    def plot_yield(self, use_50ev_split=True):
+        import matplotlib.pyplot as plt
+        plt.figure()
+        plt.errorbar(self.energy_array, self.tey, yerr=self.tey_err,
+                     label="TEY", marker="o", capsize=3)
+        if use_50ev_split:
+            plt.plot(self.energy_array, self.sey_50ev, "s--", label="SEY (<50 eV)")
+            plt.plot(self.energy_array, self.bse_50ev, "^--", label="BSE (>50 eV)")
+        else:
+            plt.errorbar(self.energy_array, self.sey, yerr=self.sey_err,
+                         label="SEY (cascade)", marker="s")
+            plt.errorbar(self.energy_array, self.bse, yerr=self.bse_err,
+                         label="BSE (primary)", marker="^")
+        plt.xlabel("Primary energy (eV)")
+        plt.ylabel("Yield (electrons/primary)")
+        plt.title(self.sample.name)
+        plt.legend()
+        plt.grid(alpha=0.3)
+        plt.show()
+
+
+# ==========================================================================
+# Validation.  Run these once per material before trusting a yield curve --
+# each one targets a specific class of bug that is invisible in the final
+# SEY curve but shifts it by tens of percent.
+# ==========================================================================
+def check_null_collisions(sample: Sample, E_s, n=200_000, seed=1):
+    """
+    (i) Every collision the transport loop starts must end in a real event.
+
+    A "null" collision -- free path consumed, nothing happened -- silently
+    lengthens the effective mean free path.  The old sampler produced one
+    every time omega or q sampling failed.  This should report 0.
+    """
+    rng = np.random.default_rng(seed)
+    diag = Diagnostics()
+    e = Electron(sample, E_s, [0, 0, 1e3], [0, 0, 1.0], rng=rng)
+    for _ in range(n):
+        e.energy = E_s
+        e.uvw = [0.0, 0.0, 1.0]
+        e.refresh_rates()
+        e.scatter(diag)
+
+    e.energy = E_s          # scatter() lowered it; reset before reading the rates
+    real = diag["elastic_events"] + diag["inelastic_events"]
+    null_frac = 1.0 - real / n
+    inel_frac = diag["inelastic_events"] / n
+    expected_inel = e.iimfp / e.itmfp if e.itmfp > 0 else float("nan")
+    return {
+        "null_fraction": null_frac,
+        "inelastic_fraction_measured": inel_frac,
+        "inelastic_fraction_expected": expected_inel,
+        "effective_imfp_inflation": (1.0 / (1.0 - null_frac)) if null_frac < 1 else np.inf,
+        "diagnostics": dict(diag),
+    }
+
+
+def check_energy_loss_spectrum(sample: Sample, E_s, n=200_000, bins=120, seed=2):
+    """
+    (ii) The sampled energy-loss distribution must reproduce the tabulated
+    DIIMFP, truncated at omega_max = E_s - E_F.
+
+    Compared through the CDF (Kolmogorov-Smirnov distance) and through the
+    mean energy loss rather than through a binned density: the omega tables
+    are log-spaced, so any linear histogram disagrees at the first and last
+    bin for reasons that have nothing to do with the sampler.  The mean loss
+    is the quantity that actually propagates into the yield -- it is the
+    stopping power per collision.
+    """
+    rng = np.random.default_rng(seed)
+    diag = Diagnostics()
+    losses = []
+    for _ in range(n):
+        ch = sample.choose_channel(E_s, rng)
+        if ch is None:
+            continue
+        w = sample.sample_energy_loss(ch, E_s, rng, diag)
+        if w is not None:
+            losses.append(w)
+    losses = np.sort(np.asarray(losses))
+    if losses.size == 0:
+        return {"n_sampled": 0, "ks_distance": np.nan, "mean_loss_error": np.nan}
+
+    # Reference pdf: linear blend of the two bracketing energy bins, exactly
+    # what the stochastic bin choice reproduces on average.
+    i, t = _bin_and_fraction(sample.Egrid, sample._clip_E(sample._imfp_abscissa(E_s)))
+    w_max = sample.omega_max(E_s)
+    grid = np.unique(np.concatenate([
+        np.asarray(sample.material_data["diimfp_se"], float)[:, 0, i],
+        np.linspace(0.0, w_max, 2000),
+    ]))
+    grid = grid[(grid >= 0.0) & (grid <= w_max)]
+
+    pdf = np.zeros_like(grid)
+    for key in ("diimfp_se", "diimfp_pl"):
+        tab = np.asarray(sample.material_data[key], float)
+        lo = np.interp(grid, tab[:, 0, i], tab[:, 1, i], left=0.0, right=0.0)
+        hi = np.interp(grid, tab[:, 0, i + 1], tab[:, 1, i + 1], left=0.0, right=0.0)
+        pdf += (1.0 - t) * lo + t * hi
+
+    cdf_ref = cumtrapz_numpy(pdf, grid)
+    total = float(cdf_ref[-1])
+    if total <= 0:
+        return {"n_sampled": int(losses.size), "ks_distance": np.nan,
+                "mean_loss_error": np.nan}
+    cdf_ref /= total
+
+    emp = np.arange(1, losses.size + 1) / losses.size
+    ref_at = np.interp(losses, grid, cdf_ref)
+    ks = float(np.max(np.abs(emp - ref_at)))
+    ks_crit = 1.36 / math.sqrt(losses.size)          # 95% critical value
+
+    trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+    mean_ref = float(trapz(pdf * grid, grid) / total)
+    mean_mc = float(losses.mean())
+
+    counts, edges = np.histogram(losses, bins=bins, range=(0.0, w_max), density=True)
+    return {"n_sampled": int(losses.size),
+            "ks_distance": ks, "ks_critical_95": ks_crit, "ks_pass": ks < ks_crit,
+            "mean_loss_mc": mean_mc, "mean_loss_table": mean_ref,
+            "mean_loss_error": (mean_mc - mean_ref) / mean_ref,
+            "omega": 0.5 * (edges[1:] + edges[:-1]), "sampled": counts,
+            "pdf_grid": grid, "pdf_ref": pdf / total}
+
+
+def check_escape_probability(sample: Sample, E_s, n=200_000, seed=3):
+    """
+    (iii) Barrier test, decoupled from transport.  Release electrons at the
+    surface with isotropic directions and compare the escaped fraction with
+
+        P = (1/2) * integral_0^1 T(E_s mu^2) d mu
+
+    This exercises the transmission coefficient, the parallel-momentum
+    refraction and the reflection bookkeeping without any table lookups.
+    """
+    rng = np.random.default_rng(seed)
+    escaped = 0
+    for _ in range(n):
+        uvw = _isotropic_direction(rng)
+        e = Electron(sample, E_s, [0.0, 0.0, 0.0], uvw, rng=rng)
+        if uvw[2] < 0 and e.escape():
+            escaped += 1
+
+    mu = np.linspace(0.0, 1.0, 20001)
+    Eperp = E_s * mu * mu
+    T = np.zeros_like(mu)
+    ok = Eperp > sample.Ui
+    T[ok] = [barrier_transmission(e, sample.Ui, sample.cfg) for e in Eperp[ok]]
+    integ = np.trapezoid(T, mu) if hasattr(np, "trapezoid") else np.trapz(T, mu)
+    analytic = 0.5 * integ
+
+    mc = escaped / n
+    err = math.sqrt(max(mc * (1 - mc), 0.0) / n)
+    return {"monte_carlo": mc, "analytic": analytic, "sigma": err,
+            "pulls": (mc - analytic) / err if err > 0 else np.nan}
+
+
+def check_collision_kinematics(sample: Sample, E_s, n=20_000, seed=4):
+    """
+    (iv) Energy and momentum bookkeeping of the inelastic vertex.
+
+    Checks, per event:
+      * q lies inside [|k - k'|, k + k']            (q-bound consistency)
+      * |k u_before - k' u_after| equals q          (the q-hat construction)
+      * E_SE = E_i + omega for the binary-encounter channel
+    """
+    rng = np.random.default_rng(seed)
+    diag = Diagnostics()
+    worst_q, worst_vec, worst_e = 0.0, 0.0, 0.0
+    n_checked = 0
+
+    for _ in range(n):
+        e = Electron(sample, E_s, [0.0, 0.0, 1e3], [0.0, 0.0, 1.0], rng=rng)
+        ch = sample.choose_channel(E_s, rng)
+        if ch is None:
+            continue
+        omega = sample.sample_energy_loss(ch, E_s, rng, diag)
+        if omega is None:
+            continue
+        qres = sample.sample_q(ch, E_s, omega, rng, diag)
+        if qres is None:
+            continue
+        q, k, kp = qres
+        n_checked += 1
+
+        worst_q = max(worst_q, max(abs(k - kp) - q, q - (k + kp), 0.0) / q)
+
+        cos_tp = min(1.0, max(-1.0, (k * k + kp * kp - q * q) / (2 * k * kp)))
+        tp = math.acos(cos_tp)
+        phip = 2 * math.pi * rng.random()
+        u0 = [0.0, 0.0, 1.0]
+        u1 = rotate_direction(u0, tp, phip)
+        qvec = np.array(u0) * k - np.array(u1) * kp
+        worst_vec = max(worst_vec, abs(np.linalg.norm(qvec) - q) / q)
+
+        q_hat = e._q_hat(u0, tp, phip, k, kp)
+        worst_vec = max(worst_vec, float(np.linalg.norm(
+            qvec / np.linalg.norm(qvec) - np.array(q_hat))))
+
+        if ch == "se":
+            t = sample.sample_target_electron(omega, q, rng, diag)
+            if t is not None:
+                r, kz = t
+                E_i = 0.5 * (r * r + kz * kz) * H2EV
+                E_f = 0.5 * (r * r + (kz + q) ** 2) * H2EV
+                worst_e = max(worst_e, abs(E_f - (E_i + omega)) / max(omega, 1e-9))
+
+    return {"n_checked": n_checked,
+            "max_q_bound_violation": worst_q,
+            "max_q_vector_error": worst_vec,
+            "max_energy_closure_error": worst_e,
+            "diagnostics": dict(diag)}
+
+
+def run_all_checks(sample: Sample, energies=(50.0, 200.0, 1000.0), verbose=True):
+    out = {}
+    if verbose:
+        print(sample.consistency_report())
+        print()
+    for E_vac in energies:
+        E_s = E_vac + sample.Ui
+        res = {
+            "null": check_null_collisions(sample, E_s, n=50_000),
+            "loss": check_energy_loss_spectrum(sample, E_s, n=50_000),
+            "escape": check_escape_probability(sample, E_s, n=50_000),
+            "kinematics": check_collision_kinematics(sample, E_s, n=5_000),
+        }
+        out[E_vac] = res
+        if verbose:
+            print(f"E_vac = {E_vac:g} eV  (E_s = {E_s:g} eV)")
+            print(f"  null collision fraction     : {res['null']['null_fraction']:.4%}")
+            print(f"  inelastic fraction meas/exp : "
+                  f"{res['null']['inelastic_fraction_measured']:.4f} / "
+                  f"{res['null']['inelastic_fraction_expected']:.4f}")
+            print(f"  loss spectrum KS / crit     : "
+                  f"{res['loss']['ks_distance']:.4f} / {res['loss']['ks_critical_95']:.4f}"
+                  f"  {'PASS' if res['loss']['ks_pass'] else 'FAIL'}")
+            print(f"  mean loss MC / table        : "
+                  f"{res['loss']['mean_loss_mc']:.3f} / {res['loss']['mean_loss_table']:.3f} eV "
+                  f"({res['loss']['mean_loss_error']:+.3%})")
+            print(f"  escape prob MC / analytic   : "
+                  f"{res['escape']['monte_carlo']:.5f} / {res['escape']['analytic']:.5f} "
+                  f"({res['escape']['pulls']:+.2f} sigma)")
+            print(f"  q-bound violation           : {res['kinematics']['max_q_bound_violation']:.2e}")
+            print(f"  q-vector construction error : {res['kinematics']['max_q_vector_error']:.2e}")
+            print(f"  energy closure error        : {res['kinematics']['max_energy_closure_error']:.2e}")
+            print()
+    return out
+
+
+def check_channel_boundaries(sample: Sample, omegas=None, threshold=1e-3):
+    """
+    (v) Are the DB's channel-resolved ELFs consistent with the Fermi energy
+    the DB reports?
+
+    Mao et al. 2008 Eq. (9) puts single-electron excitation in
+    q- <= q <= q+ with q_-+ = -/+ k_F + sqrt(k_F^2 + 2 omega).  That window is
+    exactly where the Fermi-sphere disk of Eq. (18) is non-empty, so:
+
+      * elf_se strength at q < q-  ->  losses with NO available target state.
+        Under se_channel_rule='table' those become dropped or fallback
+        secondaries; they are really plasmon losses that the FPA decomposition
+        assigned to the single-particle channel because it integrates over a
+        scanning omega_p whose k_F(omega_p) exceeds the material's k_F.
+      * elf_pl strength at q > q-  ->  the mirror image.
+
+    This routine measures the actual support of each channel table and inverts
+    the boundary to recover the k_F that the tables were built with:
+
+        from the lower edge of elf_se:  k_F = (2 omega - q-^2) / (2 q-)
+        from the upper edge of elf_se:  k_F = (q+^2 - 2 omega) / (2 q+)
+
+    A k_F_eff that is consistent across omega but differs from the DB's
+    sqrt(2 E_F) tells you exactly which value to put in
+    MCConfig.feg_fermi_energy -- or, better, that you should use
+    se_channel_rule='mao' and stop relying on the split.
+    """
+    q = np.exp(sample._qlog_grid)                     # a0^-1
+    w_grid = sample._omega_h_grid * H2EV              # eV
+    if omegas is None:
+        lo = max(float(w_grid[0]), 1.0)
+        hi = min(float(w_grid[-1]), 200.0)
+        omegas = np.geomspace(lo, hi, 12)
+
+    kF_db = sample.k_fermi_feg
+    rows = []
+    for w in omegas:
+        j = int(np.argmin(np.abs(w_grid - w)))
+        se = np.asarray(sample._elf_spl["se"].ev(
+            np.full_like(q, w_grid[j] / H2EV), sample._qlog_grid), float)
+        pl = np.asarray(sample._elf_spl["pl"].ev(
+            np.full_like(q, w_grid[j] / H2EV), sample._qlog_grid), float)
+        se = np.clip(np.nan_to_num(se), 0.0, None)
+        pl = np.clip(np.nan_to_num(pl), 0.0, None)
+
+        qm_th, qp_th = sample.mao_q_boundaries(w_grid[j])
+
+        row = {"omega": float(w_grid[j]), "q_minus_theory": qm_th,
+               "q_plus_theory": qp_th, "kF_db": kF_db}
+
+        if se.max() > 0:
+            sup = q[se > threshold * se.max()]
+            qlo, qhi = float(sup[0]), float(sup[-1])
+            wh = w_grid[j] / H2EV
+            row["se_q_lo"] = qlo
+            row["se_q_hi"] = qhi
+            row["kF_from_lower_edge"] = (2 * wh - qlo * qlo) / (2 * qlo)
+            row["kF_from_upper_edge"] = (qhi * qhi - 2 * wh) / (2 * qhi)
+            below = q < qm_th
+            trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+            tot = trapz(se, np.log(q))
+            row["se_frac_below_qminus"] = (
+                float(trapz(se[below], np.log(q[below])) / tot)
+                if below.sum() > 1 and tot > 0 else 0.0
+            )
+        if pl.max() > 0:
+            trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+            above = q > qm_th
+            tot = trapz(pl, np.log(q))
+            row["pl_frac_above_qminus"] = (
+                float(trapz(pl[above], np.log(q[above])) / tot)
+                if above.sum() > 1 and tot > 0 else 0.0
+            )
+        rows.append(row)
+    return rows
+
+
+def se_strength_lost(sample: Sample, E_s, n_omega=60):
+    """
+    DIIMFP-weighted estimate of how many single-particle secondaries the
+    'table' channel rule loses at primary energy E_s.
+
+    For each omega, the fraction of elf_se strength sitting at q < q-(omega)
+    is weighted by that omega's contribution to the inelastic rate.  Under
+    se_channel_rule='table' with on_pauli_block='drop' (the original code) this
+    fraction of 'se' events produced NO secondary at all.
+    """
+    trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+    i, _ = _bin_and_fraction(sample.Egrid, sample._clip_E(sample._imfp_abscissa(E_s)))
+    tab = np.asarray(sample.material_data["diimfp_se"], float)
+    w_tab, d_tab = tab[:, 0, i], tab[:, 1, i]
+
+    w_max = sample.omega_max(E_s)
+    if w_max <= 0:
+        return float("nan"), float("nan")
+    omegas = np.geomspace(max(w_tab[w_tab > 0].min(), 0.5), w_max, n_omega)
+    q = np.exp(sample._qlog_grid)
+
+    weight, lost = [], []
+    for w in omegas:
+        elf = np.clip(np.nan_to_num(np.asarray(
+            sample._elf_spl["se"].ev(np.full_like(q, w / H2EV), sample._qlog_grid),
+            float)), 0.0, None)
+        tot = trapz(elf, sample._qlog_grid)
+        if tot <= 0:
+            weight.append(0.0); lost.append(0.0); continue
+        qm, _ = sample.mao_q_boundaries(w)
+        m = q < qm
+        below = trapz(elf[m], sample._qlog_grid[m]) if m.sum() > 1 else 0.0
+        weight.append(float(np.interp(w, w_tab, d_tab, left=0.0, right=0.0)))
+        lost.append(below / tot)
+
+    weight = np.asarray(weight); lost = np.asarray(lost)
+    denom = trapz(weight, omegas)
+    frac = float(trapz(weight * lost, omegas) / denom) if denom > 0 else float("nan")
+
+    inv_se = float(np.interp(sample._clip_E(sample._imfp_abscissa(E_s)),
+                             sample.Egrid, sample.material_data["inv_imfp_se"]))
+    inv_pl = float(np.interp(sample._clip_E(sample._imfp_abscissa(E_s)),
+                             sample.Egrid, sample.material_data["inv_imfp_pl"]))
+    share = inv_se / max(inv_se + inv_pl, 1e-30)
+    return frac, frac * share
+
+def report_channel_boundaries(sample: Sample, energies=(100.0, 500.0, 2000.0), **kw):
+    rows = check_channel_boundaries(sample, **kw)
+    kF_db = sample.k_fermi_feg
+    print(f"Channel-boundary check for {sample.name}")
+    print(f"  DB e_fermi = {sample.e_fermi_feg:.3f} eV  ->  k_F = {kF_db:.4f} a0^-1")
+    print(f"  {'omega':>8} {'q-(th)':>8} {'se_q_lo':>8} {'kF(lo)':>8} "
+          f"{'kF(hi)':>8} {'se<q-':>7} {'pl>q-':>7}")
+    kfs, ws = [], []
+    for r in rows:
+        lo = r.get("se_q_lo", float("nan"))
+        klo = r.get("kF_from_lower_edge", float("nan"))
+        khi = r.get("kF_from_upper_edge", float("nan"))
+        fb = r.get("se_frac_below_qminus", 0.0)
+        fa = r.get("pl_frac_above_qminus", 0.0)
+        if np.isfinite(klo) and klo > 0:
+            kfs.append(klo)
+            ws.append(r["omega"])
+        print(f"  {r['omega']:8.2f} {r['q_minus_theory']:8.4f} {lo:8.4f} "
+              f"{klo:8.4f} {khi:8.4f} {fb:7.1%} {fa:7.1%}")
+
+    if len(kfs) >= 4:
+        kfs = np.asarray(kfs)
+        ws = np.asarray(ws)
+        spread = float(kfs.max() / max(kfs.min(), 1e-12))
+        slope = float(np.polyfit(np.log(ws), np.log(kfs), 1)[0])
+        print()
+        print(f"  k_F inferred from the elf_se lower edge: "
+              f"{kfs.min():.2f} - {kfs.max():.2f} a0^-1 "
+              f"(spread {spread:.1f}x, ~omega^{slope:.2f})")
+        if spread > 1.5:
+            print()
+            print("  The inferred k_F is NOT constant, so the elf_se lower edge is not a")
+            print("  pair-continuum edge, and NO single feg_fermi_energy can repair the")
+            print("  table split. This is the expected signature of an FPA database:")
+            print("  Mao Eq. (8) integrates over a scanning omega_p, so the support of")
+            print("  elf_se is a UNION of continua with different k_F(omega_p), not one")
+            print("  continuum.")
+            print("    => Keep se_channel_rule='mao' (the default). It classifies each")
+            print("       sampled (omega, q) by Mao Eq. (9) and cannot lose a secondary.")
+            print("    => Do NOT set feg_fermi_energy from this table.")
+        else:
+            ef = 0.5 * float(np.median(kfs)) ** 2 * H2EV
+            print(f"  Consistent with a single continuum: consider "
+                  f"MCConfig(feg_fermi_energy={ef:.2f})")
+
+    print()
+    print("  DIIMFP-weighted single-particle strength at q < q-")
+    print("  (this fraction produced NO secondary under 'table' + 'drop'):")
+    for E_vac in energies:
+        f_se, f_all = se_strength_lost(sample, E_vac + sample.Ui)
+        print(f"    E0 = {E_vac:7.0f} eV : {f_se:6.1%} of 'se' events, "
+              f"{f_all:6.1%} of all inelastic events")
+    return rows
+
+
+def check_barrier_limits(Ui=13.35, verbose=True):
+    """
+    (vi) The JMONSEL exponential-barrier formula must reproduce its own limits.
+
+      w -> 0        T -> 4 k1 k2 / (k1 + k2)^2   (abrupt step)
+      w -> infinity T -> 1                       (classical)
+
+    Both are checked against the independently-coded 'abrupt' and 'classical'
+    branches, so an algebra or unit error in the sinh expression shows up as a
+    mismatch rather than as a plausible-looking curve.
+    """
+    c_ab = MCConfig(barrier_model="abrupt")
+    c_cl = MCConfig(barrier_model="classical")
+    energies = [Ui * f for f in (1.001, 1.01, 1.1, 1.5, 2.0, 5.0, 20.0, 100.0)]
+
+    worst_small, worst_large = 0.0, 0.0
+    for E in energies:
+        t_ab = barrier_transmission(E, Ui, c_ab)
+        t_cl = barrier_transmission(E, Ui, c_cl)
+        t_s = barrier_transmission(E, Ui, MCConfig(barrier_model="expqm",
+                                                   barrier_width=1e-6))
+        t_l = barrier_transmission(E, Ui, MCConfig(barrier_model="expqm",
+                                                   barrier_width=5e3))
+        worst_small = max(worst_small, abs(t_s - t_ab))
+        worst_large = max(worst_large, abs(t_l - t_cl))
+
+    if verbose:
+        print(f"Barrier model check (Ui = {Ui:.2f} eV)")
+        print(f"  max |T(w=1e-6 A) - T_abrupt|    = {worst_small:.3e}")
+        print(f"  max |T(w=5000 A) - T_classical| = {worst_large:.3e}")
+        print()
+        print(f"  {'E_perp':>8} {'abrupt':>9} {'w=0.5A':>9} {'w=1A':>9} "
+              f"{'w=2A':>9} {'w=5A':>9} {'classical':>10}")
+        for E in energies:
+            cfgs = [c_ab] + [MCConfig(barrier_model="expqm", barrier_width=w)
+                             for w in (0.5, 1.0, 2.0, 5.0)] + [c_cl]
+            vals = [barrier_transmission(E, Ui, c) for c in cfgs]
+            print(f"  {E:8.2f} " + " ".join(f"{v:9.5f}" for v in vals[:-1])
+                  + f" {vals[-1]:10.5f}")
+    return {"abrupt_limit_error": worst_small, "classical_limit_error": worst_large}
+
+
+def stopping_power(sample: Sample, E_s):
+    """
+    Stopping power dE/ds in eV/Angstrom at VB-bottom-referenced energy E_s.
+
+        dE/ds = integral_0^omega_max  omega * DIIMFP(omega; E_s) d omega
+
+    Also returns the IMFP and the mean loss per collision.
+    """
+    trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+    i, t = _bin_and_fraction(sample.Egrid, sample._clip_E(sample._imfp_abscissa(E_s)))
+    w_max = sample.omega_max(E_s)
+    if w_max <= 0:
+        return dict(E_s=E_s, imfp=float("nan"), dEds=0.0, mean_loss=float("nan"))
+
+    grid = np.linspace(0.0, w_max, 4000)
+    pdf = np.zeros_like(grid)
+    for key in ("diimfp_se", "diimfp_pl"):
+        tab = np.asarray(sample.material_data[key], float)
+        lo = np.interp(grid, tab[:, 0, i], tab[:, 1, i], left=0.0, right=0.0)
+        hi = np.interp(grid, tab[:, 0, i + 1], tab[:, 1, i + 1], left=0.0, right=0.0)
+        pdf += (1.0 - t) * lo + t * hi
+
+    inv_imfp = float(trapz(pdf, grid))
+    dEds = float(trapz(pdf * grid, grid))
+    return dict(E_s=E_s,
+                imfp=(1.0 / inv_imfp) if inv_imfp > 0 else float("inf"),
+                dEds=dEds,
+                mean_loss=(dEds / inv_imfp) if inv_imfp > 0 else float("nan"))
+
+
+def report_low_energy_transport(sample: Sample, energies=None):
+    """
+    IMFP and stopping power in the range that sets the SE escape depth.
+
+    This is the quantity to check when delta_max sits at the wrong primary
+    energy while BSE already agrees: BSE is fixed by primary transport, so a
+    correct BSE plus a low delta_max points at the SECONDARY escape depth, i.e.
+    the IMFP below ~50 eV, which is where the FPA is an extrapolation rather
+    than a validated calculation.
+
+    Compare the dE/ds column against Villarrubia et al., Ultramicroscopy 154
+    (2015) Fig. 3, which plots exactly this for Cu -- measured data from
+    Hovington, Luo, and Al-Ahmad & Watt as tabulated by Joy -- with the same
+    abscissa convention used here (kinetic energy referenced to the bottom of
+    the conduction band).
+    """
+    if energies is None:
+        energies = [5, 7, 10, 15, 20, 30, 50, 75, 100, 150, 200, 300, 500, 1000]
+    print(f"Low-energy transport for {sample.name}")
+    print(f"  E_F = {sample.e_fermi:.2f} eV, U_i = {sample.Ui:.2f} eV "
+          f"(escape needs E_s > U_i)")
+    print(f"  {'E_s':>7} {'E_vac':>7} {'IMFP':>8} {'EMFP':>7} {'<cos>':>7} "
+          f"{'l_tr':>7} {'l_diff':>7} {'dE/ds':>7} {'loss':>7}")
+    print(f"  {'(eV)':>7} {'(eV)':>7} {'(A)':>8} {'(A)':>7} {'':>7} "
+          f"{'(A)':>7} {'(A)':>7} {'eV/A':>7} {'eV':>7}")
+    clamp = sample.cfg.elastic_min_energy
+    for E in energies:
+        r = stopping_power(sample, float(E))
+        emfp = sample.get_emfp(float(E))
+        mu = sample.mean_cos_elastic(float(E))
+        l_tr = emfp / max(1.0 - mu, 1e-6)
+        lam_in = r["imfp"]
+        l_diff = (math.sqrt(lam_in * l_tr / 3.0)
+                  if np.isfinite(lam_in) and lam_in > 0 else float("nan"))
+        mark = " *" if (E - sample.Ui) < clamp else ""
+        print(f"  {E:7.1f} {E - sample.Ui:7.1f} {lam_in:8.2f} {emfp:7.2f} "
+              f"{mu:7.3f} {l_tr:7.2f} {l_diff:7.2f} {r['dEds']:7.3f} "
+              f"{r['mean_loss']:7.2f}{mark}")
+    print(f"\n  * = E_vac below cfg.elastic_min_energy ({clamp:g} eV), so the")
+    print(f"      elastic DCS is FROZEN at its {clamp:g} eV value. Every secondary")
+    print(f"      with E_s < {sample.Ui + clamp:.1f} eV shares one elastic MFP -- and those")
+    print( "      are exactly the electrons that carry delta.")
+    print( "  l_diff = sqrt(IMFP * l_tr / 3) is the diffusion estimate of the SE")
+    print( "      escape depth; compare it with escape_depth_analysis().")
+    print("\n  If l_diff greatly exceeds the measured escape depth, the SE escape")
+    print("  is NOT diffusion-limited by these MFPs and something else (barrier,")
+    print("  angular distribution) dominates. If they agree, the escape depth is")
+    print("  set by whichever of IMFP / l_tr is smaller at 15-30 eV.")
+
+
+def escape_depth_analysis(sample: Sample, E0, n_traj=400, seed=5, nbins=14, zmax=None):
+    """
+    Measure the secondary-electron escape depth DIRECTLY, rather than inferring
+    it from the IMFP.
+
+    Histograms the depth at which secondaries are created against the depth at
+    which the ones that escaped were created.  The ratio is the escape
+    probability P(z), whose decay length is the escape depth.  No functional
+    form is assumed and no separate simulation is needed -- both distributions
+    come from the same trajectories.
+
+    This is the decisive test when delta_max sits at the wrong primary energy
+    while BSE already agrees: BSE fixes primary transport, so a wrong delta_max
+    must come from either the SE source term (dE/ds) or the escape depth, and
+    this separates them.
+    """
+    cfg = MCConfig(**{**sample.cfg.__dict__, "collect_birth_depths": True,
+                      "collect_spectra": True})
+    smp = Sample(sample.name, db_path=getattr(sample, "_db_path", "MaterialDatabase.pkl"),
+                 config=cfg) if not hasattr(sample, "_reuse") else sample
+    created, escaped = [], []
+    for i in range(n_traj):
+        r = simulate_trajectory(smp, float(E0), 0.0, np.random.default_rng([seed, i]))
+        created.extend(r.birth_depths)
+        escaped.extend(e.birth_depth for e in r.emissions if e.is_cascade)
+
+    created = np.asarray(created, float)
+    escaped = np.asarray(escaped, float)
+    if created.size == 0:
+        return {"n_created": 0}
+
+    if zmax is None:
+        # Bin over the range where escapes actually occur. Using the CREATED
+        # distribution instead makes the bins ~26 A wide at 3 keV, far coarser
+        # than the decay length, and the fitted lambda then measures noise.
+        zmax = (float(np.percentile(escaped, 97)) if escaped.size > 20
+                else float(np.percentile(created, 20)))
+        zmax = max(zmax, 4.0)
+    edges = np.linspace(0.0, zmax, nbins + 1)
+    c, _ = np.histogram(created, bins=edges)
+    e, _ = np.histogram(escaped, bins=edges)
+    z = 0.5 * (edges[1:] + edges[:-1])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        P = np.where(c > 0, e / np.maximum(c, 1), np.nan)
+
+    # P(z) is NOT a pure exponential: near z=0 it plateaus, because escape is
+    # limited by the escape cone and barrier transmission rather than by
+    # attenuation.  Including that plateau biases the fitted decay length
+    # upward, so the fit starts past the peak of P.
+    lam = float("nan")
+    ok = (c > 30) & np.isfinite(P) & (P > 0)
+    if ok.sum() >= 3:
+        i_pk = int(np.nanargmax(np.where(ok, P, np.nan)))
+        fit = ok.copy()
+        fit[:i_pk] = False
+        if fit.sum() >= 3:
+            sl = np.polyfit(z[fit], np.log(P[fit]), 1)[0]
+            lam = -1.0 / sl if sl < 0 else float("nan")
+
+    print(f"SE escape depth, {sample.name}, E0 = {E0:g} eV, {n_traj} trajectories")
+    print(f"  secondaries created: {created.size}   escaped: {escaped.size} "
+          f"({escaped.size / created.size:.1%})")
+    print(f"  {'z (A)':>8} {'created':>9} {'escaped':>9} {'P(escape)':>11}")
+    for zi, ci, ei, pi in zip(z, c, e, P):
+        print(f"  {zi:8.1f} {ci:9d} {ei:9d} {pi:11.4f}")
+    print(f"\n  fitted escape depth lambda = {lam:.2f} A")
+    print(f"  median creation depth      = {np.median(created):.2f} A")
+    print(f"  median escape-origin depth = "
+          f"{np.median(escaped) if escaped.size else float('nan'):.2f} A")
+    return {"z": z, "created": c, "escaped": e, "P": P, "lambda": lam,
+            "n_created": created.size, "n_escaped": escaped.size}
+
+
+def check_elastic_consistency(sample: Sample, nn_distance=None):
+    """
+    (vii) Sanity checks on the ELSEPA-derived elastic tables.
+
+    Three independent things are tested:
+
+    1. Is the EMFP ever shorter than an interatomic distance?  Below roughly
+       one nearest-neighbour spacing the independent-atom / muffin-tin picture
+       has broken down: the electron cannot be said to scatter from one atom at
+       a time.  Values there should be treated as an extrapolation artifact,
+       not as physics, and they dominate the SE escape depth.
+
+    2. Does <cos theta> derived from the DECS table agree with ELSEPA's own
+       transport cross-section?  optlib computes both -- sigma_el and sigma_tr
+       come from the ELSEPA header, while decs is the tabulated angular
+       distribution -- so
+              1 - sigma_tr/sigma_el  ==  <cos theta>_DECS
+       is a closed consistency check on the parsing. A mismatch means the
+       angular table and the cross sections describe different things.
+
+    3. Where is the DCS frozen by the low-energy clamp, and how many of the
+       secondaries that carry delta fall in that region?
+    """
+    md = sample.material_data
+    Eg = sample.Egrid
+    emfp = sample.emfp_table
+
+    print(f"Elastic consistency for {sample.name}")
+
+    # --- 1. unphysically short mean free paths
+    if nn_distance is None:
+        n = md.get("atomic_density")
+        nn_distance = (1.0 / n) ** (1.0 / 3.0) if n else None
+    bad = np.where(emfp < (nn_distance if nn_distance else 1.5))[0]
+    if nn_distance:
+        print(f"  atomic density gives a mean spacing of {nn_distance:.2f} A")
+    else:
+        print("  no atomic_density in DB; using 1.5 A as the plausibility floor")
+    if bad.size:
+        print(f"  !! EMFP is below that spacing at {bad.size} grid point(s), "
+              f"E = {Eg[bad[0]]:.1f} - {Eg[bad[-1]]:.1f} eV "
+              f"(min EMFP = {emfp.min():.2f} A)")
+        print("     The independent-atom model does not apply there.")
+    else:
+        print("  EMFP exceeds the mean atomic spacing everywhere: OK")
+
+    # --- 2. DECS vs ELSEPA transport cross section
+    trmfp = md.get("trmfp")
+    if trmfp is not None:
+        trmfp = np.asarray(trmfp, float)
+        print(f"\n  {'E (eV)':>9} {'<cos>_DECS':>11} {'<cos>_sigma':>12} {'diff':>9}")
+        worst = 0.0
+        for i in range(0, len(Eg), max(1, len(Eg) // 12)):
+            mu_decs = sample.mean_cos_elastic(
+                Eg[i] + (sample.Ui if sample.cfg.emfp_energy_ref == "vacuum" else 0.0))
+            mu_sig = 1.0 - emfp[i] / trmfp[i] if trmfp[i] > 0 else float("nan")
+            d = abs(mu_decs - mu_sig)
+            worst = max(worst, d if np.isfinite(d) else 0.0)
+            print(f"  {Eg[i]:9.1f} {mu_decs:11.3f} {mu_sig:12.3f} {d:9.3f}")
+        print(f"\n  worst |difference| = {worst:.3f}")
+        if worst > 0.05:
+            print("  !! The DECS table and the tabulated cross sections disagree.")
+            print("     One of them is not what seemc assumes it is.")
+    else:
+        print("\n  No 'trmfp' in the DB. optlib's ElsepaWrapper computes it "
+              "(mat.trmfp),\n  so adding it to the database would enable a "
+              "direct check of the DECS\n  table against ELSEPA's own transport "
+              "cross section.")
+
+    # --- 3. the clamp
+    clamp = sample.cfg.elastic_min_energy
+    ref = sample.cfg.emfp_energy_ref
+    frozen_below = sample.Ui + clamp if ref == "vacuum" else clamp
+    print(f"\n  emfp_energy_ref = '{ref}', elastic_min_energy = {clamp:g} eV")
+    print(f"  => every electron with E_s < {frozen_below:.1f} eV uses the same "
+          f"elastic DCS")
+    print(f"  => EMFP there = {sample.get_emfp(frozen_below - 0.1):.2f} A")
+    print("\n  IMPORTANT: optlib's ElsepaWrapper.write_input_files() writes the")
+    print("  energies it is handed straight into 'EV' with no shift, so the")
+    print("  reference of the emfp table is whatever array the DB builder passed.")
+    print("  If that was the same grid used for the IMFP (VB-bottom referenced),")
+    print("  then emfp is ALSO VB-bottom referenced and subtracting U_i here is a")
+    print("  double correction. Test it with MCConfig(emfp_energy_ref='vb_bottom').")
+
+
+def verify_statistics(sample_name, E0, n_small=250, n_large=1000, db_path="MaterialDatabase.pkl",
+                      config=None, seed=99, parallel=True):
+    """
+    (viii) Confirm that n_traj actually reaches the simulation.
+
+    Two independent tests, because a silently-ignored n_traj produces results
+    that look perfectly reasonable:
+
+      1. SCALING.  The standard error must fall as 1/sqrt(N).  Quadrupling the
+         trajectory count must halve it.  If the error is unchanged, the larger
+         run simulated the same number of trajectories as the smaller one.
+      2. INDEPENDENCE.  With the SAME seed, a larger run reuses the smaller
+         run's trajectories and adds more, so the means must DIFFER (by roughly
+         the standard error). Identical means to 3+ decimals mean the extra
+         trajectories were never run.
+
+    Test 2 is the one that catches the failure that motivated this function:
+    a 10000-trajectory run reproducing a 2000-trajectory run bit-for-bit.
+    """
+    cfg = config or MCConfig()
+    out = {}
+    for label, n in (("small", n_small), ("large", n_large)):
+        mc = SEEMC(np.array([float(E0)]), sample_name, angle=0.0, n_traj=n,
+                   db_path=db_path, config=cfg, seed=seed)
+        mc.run_simulation(use_parallel=parallel, progress=False, verbose=False)
+        out[label] = dict(requested=n, completed=int(mc.n_completed[0]),
+                          tey=float(mc.tey[0]), err=float(mc.tey_err[0]))
+
+    s, l = out["small"], out["large"]
+    ratio_expected = math.sqrt(l["requested"] / s["requested"])
+    ratio_actual = s["err"] / l["err"] if l["err"] > 0 else float("inf")
+    identical = abs(s["tey"] - l["tey"]) < 1e-9
+
+    print(f"Statistics check, {sample_name} at E0 = {E0:g} eV")
+    for k in ("small", "large"):
+        d = out[k]
+        print(f"  {k:>5}: requested {d['requested']:>6}  completed "
+              f"{d['completed']:>6}  TEY {d['tey']:.4f} +- {d['err']:.4f}")
+    print(f"\n  error ratio  measured {ratio_actual:.2f}  expected "
+          f"{ratio_expected:.2f}")
+    print(f"  means identical: {identical}")
+
+    ok = (s["completed"] == s["requested"] and l["completed"] == l["requested"]
+          and not identical and abs(ratio_actual - ratio_expected) < 0.5 * ratio_expected)
+    print(f"\n  {'PASS' if ok else 'FAIL'}: n_traj "
+          f"{'reaches' if ok else 'does NOT reach'} the simulation")
+    if not ok and identical:
+        print("  Identical means with the same seed prove the larger run did not")
+        print("  simulate more trajectories. Check that the value printed in your")
+        print("  script header is the same variable passed to SEEMC(n_traj=...).")
+    out["pass"] = ok
+    return out
