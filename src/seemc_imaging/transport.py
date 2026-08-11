@@ -560,8 +560,9 @@ class Sample:
     def __init__(self, name, db_path="MaterialDatabase.pkl", config: Optional[MCConfig] = None):
         self.cfg = config or MCConfig()
         self.cfg.validate()
+        self.db_path = os.fspath(db_path)
 
-        with open(db_path, "rb") as fp:
+        with open(self.db_path, "rb") as fp:
             data = pickle.load(fp)
 
         if isinstance(data, dict):
@@ -1987,9 +1988,54 @@ def incident_direction(E0, sample: Sample, angle_rad,
     return E_s, [value / direction_length for value in direction]
 
 
+def refract_incident_direction(E0, sample: Sample, vacuum_direction,
+                               surface_normal):
+    """Refract a fixed global beam direction into the local solid surface.
+
+    This is the topography-aware counterpart to :func:`incident_direction`.
+    ``vacuum_direction`` points from the source toward the specimen, while
+    ``surface_normal`` points from solid to vacuum.  The tangential momentum is
+    conserved as the electron gains the inner-potential energy ``U_i``.
+    """
+    E0 = float(E0)
+    if not math.isfinite(E0) or E0 < 0.0:
+        raise ValueError("E0 must be finite and non-negative")
+    normal = _vec3(surface_normal)
+    normal_norm = math.sqrt(_dot3(normal, normal))
+    if normal_norm == 0.0:
+        raise ValueError("surface_normal must be non-zero")
+    normal = tuple(value / normal_norm for value in normal)
+    vacuum = _vec3(vacuum_direction)
+    vacuum_norm = math.sqrt(_dot3(vacuum, vacuum))
+    if vacuum_norm == 0.0:
+        raise ValueError("vacuum_direction must be non-zero")
+    vacuum = tuple(value / vacuum_norm for value in vacuum)
+
+    normal_projection = _dot3(vacuum, normal)
+    if normal_projection >= -1e-15:
+        raise ValueError("vacuum_direction does not point into the local surface")
+
+    E_s = E0 + sample.Ui
+    tangent_vacuum = [
+        vacuum[index] - normal_projection * normal[index]
+        for index in range(3)
+    ]
+    tangent_scale = math.sqrt(max(E0, 0.0) / E_s)
+    tangent_solid = [value * tangent_scale for value in tangent_vacuum]
+    tangent_sq = _dot3(tangent_solid, tangent_solid)
+    inward_component = math.sqrt(max(1.0 - tangent_sq, 0.0))
+    direction = [
+        tangent_solid[index] - inward_component * normal[index]
+        for index in range(3)
+    ]
+    norm = math.sqrt(_dot3(direction, direction))
+    return E_s, [value / norm for value in direction]
+
+
 def simulate_trajectory(sample: Sample, E0, angle_rad, rng, track=False,
                         history=False, trajectory_id=None, geometry=None,
-                        launch_position=None, azimuth_rad=0.0):
+                        launch_position=None, azimuth_rad=0.0,
+                        vacuum_direction=None, surface_normal=None):
     """Transport one primary and its cascade, optionally recording provenance."""
     cfg = sample.cfg
     res = TrajectoryResult()
@@ -1999,19 +2045,43 @@ def simulate_trajectory(sample: Sample, E0, angle_rad, rng, track=False,
     if not isinstance(geometry, Geometry):
         raise TypeError("geometry must provide first_hit() and region_at()")
     if launch_position is None:
-        launch_position = geometry.point if isinstance(geometry, Plane) \
-            else (0.0, 0.0, 0.0)
+        launch_position = getattr(geometry, "point", (0.0, 0.0, 0.0))
     launch_position = [float(value) for value in launch_position]
-    surface_normal = geometry.outward_normal if isinstance(geometry, Plane) \
-        else (0.0, 0.0, -1.0)
+    if surface_normal is None:
+        if hasattr(geometry, "surface_normal_at"):
+            surface_normal = geometry.surface_normal_at(
+                launch_position, incoming_direction=vacuum_direction
+            )
+        else:
+            surface_normal = getattr(
+                geometry, "outward_normal", (0.0, 0.0, -1.0)
+            )
+    surface_normal = _vec3(surface_normal)
     initial_region = geometry.region_at(launch_position)
+    solid_region = getattr(geometry, "solid_region", SOLID_REGION)
+    if initial_region != solid_region:
+        raise ValueError("launch_position must lie on or inside the solid")
 
-    E_s, uvw0 = incident_direction(
-        float(E0), sample, angle_rad,
-        surface_normal=surface_normal, azimuth_rad=azimuth_rad,
-    )
+    history_angle = float(angle_rad)
+    if vacuum_direction is None:
+        E_s, uvw0 = incident_direction(
+            float(E0), sample, angle_rad,
+            surface_normal=surface_normal, azimuth_rad=azimuth_rad,
+        )
+    else:
+        E_s, uvw0 = refract_incident_direction(
+            float(E0), sample, vacuum_direction, surface_normal
+        )
+        vacuum = _vec3(vacuum_direction)
+        vacuum_norm = math.sqrt(_dot3(vacuum, vacuum))
+        vacuum = tuple(value / vacuum_norm for value in vacuum)
+        outward = _vec3(surface_normal)
+        outward_norm = math.sqrt(_dot3(outward, outward))
+        outward = tuple(value / outward_norm for value in outward)
+        local_cosine = max(-1.0, min(1.0, -_dot3(vacuum, outward)))
+        history_angle = math.acos(local_cosine)
     recorder = _HistoryRecorder(
-        uvw0, E0, angle_rad, launch_position=launch_position,
+        uvw0, E0, history_angle, launch_position=launch_position,
         trajectory_id=trajectory_id, geometry=geometry,
         reference_surface_normal=surface_normal,
     ) if history else None
@@ -2150,7 +2220,8 @@ _G = None
 
 
 def _init_worker(sample_name, db_path, config, angle_rad, track, history,
-                 geometry=None, launch_position=None, azimuth_rad=0.0):
+                 geometry=None, launch_position=None, azimuth_rad=0.0,
+                 vacuum_direction=None, surface_normal=None):
     global _G
     from types import SimpleNamespace
     _G = SimpleNamespace(
@@ -2161,6 +2232,8 @@ def _init_worker(sample_name, db_path, config, angle_rad, track, history,
         geometry=_REFERENCE_PLANE if geometry is None else geometry,
         launch_position=launch_position,
         azimuth=float(azimuth_rad),
+        vacuum_direction=vacuum_direction,
+        surface_normal=surface_normal,
     )
 
 
@@ -2171,7 +2244,8 @@ def _worker_task(args):
         _G.sample, E0, _G.angle, rng, track=_G.track,
         history=_G.history, trajectory_id=trajectory_id,
         geometry=_G.geometry, launch_position=_G.launch_position,
-        azimuth_rad=_G.azimuth,
+        azimuth_rad=_G.azimuth, vacuum_direction=_G.vacuum_direction,
+        surface_normal=_G.surface_normal,
     )
     return (r.tey, r.sey_cascade, r.bse_cascade, r.sey_50ev, r.bse_50ev,
             r.emissions, r.tracks if _G.track else None, r.history,
@@ -2197,7 +2271,8 @@ class SEEMC:
                  cb_ref=False, track=False, db_path="MaterialDatabase.pkl",
                  config: Optional[MCConfig] = None, seed=12345,
                  history=False, geometry=None, launch_position=None,
-                 azimuth_rad=0.0):
+                 azimuth_rad=0.0, vacuum_direction=None,
+                 surface_normal=None):
         self.energy_array = np.asarray(energy_array, dtype=float)
         self.cfg = config or MCConfig()
         self.cfg.validate()
@@ -2215,6 +2290,12 @@ class SEEMC:
             else tuple(float(value) for value in launch_position)
         )
         self.incident_azimuth = float(azimuth_rad)
+        self.vacuum_direction = (
+            None if vacuum_direction is None else _vec3(vacuum_direction)
+        )
+        self.surface_normal = (
+            None if surface_normal is None else _vec3(surface_normal)
+        )
         self.cb_ref = cb_ref
         self.seed = int(seed)
 
@@ -2273,7 +2354,8 @@ class SEEMC:
                 initargs=(self.sample.name, self.db_path, self.cfg,
                           self.incident_angle, self.track_trajectories,
                           self.collect_history, self.geometry,
-                          self.launch_position, self.incident_azimuth),
+                          self.launch_position, self.incident_azimuth,
+                          self.vacuum_direction, self.surface_normal),
             )
         else:
             pool = None
@@ -2354,7 +2436,9 @@ class SEEMC:
                                 history=self.collect_history,
                                 trajectory_id=traj, geometry=self.geometry,
                                 launch_position=self.launch_position,
-                                azimuth_rad=self.incident_azimuth)
+                                azimuth_rad=self.incident_azimuth,
+                                vacuum_direction=self.vacuum_direction,
+                                surface_normal=self.surface_normal)
         return (r.tey, r.sey_cascade, r.bse_cascade, r.sey_50ev, r.bse_50ev,
                 r.emissions, r.tracks if self.track_trajectories else None,
                 r.history, dict(r.diagnostics))

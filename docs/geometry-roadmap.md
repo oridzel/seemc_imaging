@@ -38,8 +38,11 @@ A hit record should contain:
 - backend primitive or triangle ID for diagnostics.
 
 This contract and the analytic `Plane` backend are implemented in version
-0.2.0. `SurfaceHit.normal` is crossing-oriented: it points from `region_from`
-to `region_to`.
+0.2.0. Version 0.3.0 adds the nearest-hit union `Scene` and the analytic
+`TrapezoidalLine`. `SurfaceHit.normal` is crossing-oriented: it points from
+`region_from` to `region_to`. Version 0.4.0 adds the production raster driver,
+finite-beam sampling, population maps, uncertainty maps, and landing-surface
+fractions.
 
 Transport then follows the already-validated planar rule:
 
@@ -71,15 +74,21 @@ a parameterized Python/CAD description will usually be easier to audit and vary.
 1. **Completed:** replace the hard-coded planar calculation with a `Plane`
    backend, local boundary normals, region transitions, and bitwise-identical
    seeded transport.
-2. Add analytic sphere, box, cylinder, and extruded trapezoid primitives.
-3. Add union-of-regions scene traversal and material IDs.
-4. Add raster pixel ID, dwell weighting, and detector
-   acceptance to the existing provenance records.
-5. Add a triangle-mesh backend and compare every simple mesh against its
+2. **Completed for the first structured specimen:** analytic infinite
+   extruded trapezoidal line with exact top and sidewall intersections.
+3. **Completed for same-material unions:** nearest-hit scene traversal that
+   suppresses buried faces. Material-to-material interfaces remain deferred.
+4. **Completed for raw emission images:** deterministic two-dimensional raster,
+   Gaussian beam spot, pixel identifiers, population-resolved count/yield/SEM
+   maps, and per-surface landing fractions.
+5. Add sphere, box, cylinder, and finite-length trapezoid primitives.
+6. Add physical dwell/current scaling and detector acceptance to the emitted
+   populations.
+7. Add a triangle-mesh backend and compare every simple mesh against its
    analytic equivalent, including grazing incidence.
-6. Add structured single-material lines/trenches and form population-resolved
-   images.
-7. Add multi-material interfaces only after the single-material geometry and
+8. Add trenches and finite structures for genuinely two-dimensional expected
+   contrast; the current infinite line repeats its mean profile along y.
+9. Add multi-material interfaces only after the single-material geometry and
    signal decomposition are validated.
 
 ## Geometry tests required before image work

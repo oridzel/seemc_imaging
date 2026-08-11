@@ -10,16 +10,27 @@ The package currently contains:
 - the validated semi-infinite transport model behind a geometry interface;
 - an exact analytic `Plane` backend with translated/rotated planes, local
   normals, and solid/vacuum region IDs;
+- an analytic `TrapezoidalLine` united with a semi-infinite substrate, with
+  exact top, sidewall, and exposed-substrate intersections;
+- a nearest-hit `Scene` that suppresses faces buried inside unions of solids;
+- fixed laboratory-frame beam directions with local surface refraction;
 - original-primary and cascade yield bookkeeping;
 - the conventional 50 eV SE/BSE split;
 - opt-in collision, ancestry, boundary, and fate history;
 - deterministic serial and multiprocessing seeds;
+- a deterministic two-dimensional raster driver with Gaussian beam-spot
+  sampling in the plane normal to the beam;
+- per-pixel count, yield, and standard-error maps for energy, ancestry,
+  generation, and operational SE1/SE2/BSE1/BSE2 channels;
+- actual landing-position, local-incidence, and per-surface landing-fraction
+  maps;
+- compressed NPZ, wide CSV, and optional figure export;
 - regression tests against the pre-fork planar snapshot.
 
-Structured surface geometry, rastering, detector response, and
-SE1/SE2/BSE1/BSE2 classifiers are deliberately not hard-coded yet. The event
-history is the raw evidence from which alternative population definitions can
-be compared.
+Detector response is deliberately not hard-coded yet. The event history is the
+raw evidence from which alternative population definitions can be compared.
+Version 0.4.0 includes a named `branch_v1` SE1/SE2/BSE1/BSE2 post-processor
+alongside the unambiguous energy-cut and ancestry channels.
 
 ## Installation
 
@@ -86,6 +97,109 @@ local crossing normal, source/target regions, and backend primitive ID. Emission
 `uz` is now the cosine relative to the local outward normal; for the default
 plane it is exactly the former `abs(uvw[2])` value.
 
+## Trapezoidal line geometry
+
+The first structured specimen is a single-material line, infinite along `y`,
+on a semi-infinite substrate. Vacuum is toward negative `z`, the substrate
+surface is at `z=0`, and dimensions are currently specified in Angstrom:
+
+```python
+import numpy as np
+
+from seemc_imaging import Sample, TrapezoidalLine, simulate_trajectory
+
+sample = Sample("Cu", db_path="MaterialDatabase.pkl")
+line = TrapezoidalLine(
+    top_width=500.0,       # 50 nm
+    bottom_width=700.0,    # 70 nm
+    height=500.0,          # 50 nm
+)
+
+# x locates a vertical beam ray on the horizontal plane through the line top.
+beam = (0.0, 0.0, 1.0)
+launch_hit = line.launch_surface(x=300.0, vacuum_direction=beam)
+result = simulate_trajectory(
+    sample,
+    E0=1000.0,
+    angle_rad=0.0,         # ignored when vacuum_direction is supplied
+    rng=np.random.default_rng(12345),
+    geometry=line,
+    launch_position=launch_hit.position,
+    vacuum_direction=beam,
+    history=True,
+)
+```
+
+The global beam stays vertical across the scan. On a sidewall, its local angle
+is computed from the sidewall normal and the incident direction is refracted
+through the surface barrier. Surface IDs distinguish `.top`, `.left`, `.right`,
+and `.substrate`. The buried `.base` face is never returned as a physical
+crossing.
+
+Run the included noisy one-dimensional scan with:
+
+```bash
+python examples/trapezoidal_line_scan.py MaterialDatabase.pkl \
+  --material Cu --energy-ev 1000 --pixels 101 --trajectories 100 \
+  --top-width-nm 50 --bottom-width-nm 70 --height-nm 50 \
+  --field-width-nm 150 --output line_scan.csv
+```
+
+The CSV contains the surface profile, local incidence angle, TEY, cascade-origin
+SE/BSE yields, the conventional 50 eV split, and the TEY standard error at each
+raster position. It is a raw emission-yield profile, not yet a detector-specific
+SEM intensity.
+
+## Population-resolved raster
+
+The production raster samples a finite Gaussian beam in the plane normal to
+the laboratory beam direction. Each pixel contains independent primary
+cascades; pixels can run serially or in parallel with identical seeded results:
+
+```python
+import numpy as np
+
+from seemc_imaging import (
+    RasterConfig, RasterDriver, Sample, TrapezoidalLine,
+)
+
+sample = Sample("Cu", db_path="MaterialDatabase.pkl")
+line = TrapezoidalLine(
+    top_width=500.0, bottom_width=700.0, height=500.0,
+)
+config = RasterConfig(
+    energy_ev=1000.0,
+    x_positions=np.linspace(-750.0, 750.0, 101),
+    y_positions=np.linspace(-250.0, 250.0, 21),
+    primaries_per_pixel=100,
+    beam_fwhm=20.0,       # 2 nm; scalar or (u, v), in Angstrom
+    seed=20260811,
+)
+result = RasterDriver(sample, line, config).run(use_parallel=True)
+result.save_npz("trapezoidal_raster.npz")
+result.save_csv("trapezoidal_raster.csv")
+```
+
+Every population has `count_maps`, `yield_maps`, and `sem_maps`. For example,
+`result.yield_maps["se1"]` is the operational SE1 yield image, while
+`result.yield_maps["sey_50ev"]` retains the conventional energy-cut SE image.
+The result also reports actual landing coordinates, local incidence, and the
+fraction of primaries landing on each named surface.
+
+Run the full command-line example with:
+
+```bash
+python examples/trapezoidal_raster.py MaterialDatabase.pkl \
+  --material Cu --energy-ev 1000 --nx 101 --ny 21 \
+  --primaries-per-pixel 100 --beam-fwhm-nm 2 --parallel \
+  --output-prefix trapezoidal_raster
+```
+
+This writes a self-describing compressed NPZ and a wide per-pixel CSV. Add
+`--plot` after installing `seemc-imaging[plot]` to render six population maps.
+See [raster-driver.md](docs/raster-driver.md) for the exact channel definitions,
+RNG scheme, uncertainty calculation, and output fields.
+
 ## Run a small ensemble
 
 ```python
@@ -124,6 +238,17 @@ The test suite uses a small synthetic material database. It verifies that:
   and repeated internal reflections;
 - translated and rotated planes report exact first hits, local normals,
   regions, depth, and lateral distance;
+- trapezoidal top/side/substrate intersections agree with closed-form results
+  over six orders of length scale;
+- the line/substrate union suppresses its buried base and coincident seam;
+- a fixed global beam acquires the correct local sidewall incidence and
+  refraction;
+- a zero-width beam consumes no spot-sampling random number;
+- changing the beam FWHM on a homogeneous plane changes landing coordinates
+  but not the assigned collision streams or population counts;
+- a Gaussian spot at an edge mixes top and sidewall landings correctly;
+- every population partition identity holds per trajectory and per pixel;
+- serial and spawn-parallel raster maps are exactly identical;
 - ancestry links, collision counts, emission links, and terminal fates are
   internally consistent;
 - the ensemble driver retains histories by energy and trajectory ID.
