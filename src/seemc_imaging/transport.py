@@ -1095,6 +1095,12 @@ class Sample:
 # --------------------------------------------------------------------------
 Vec3 = Tuple[float, float, float]
 
+# Relativistic free-flight timing used only by opt-in trajectory recording.
+# c is expressed in Angstrom/fs so transport coordinates and elapsed times
+# remain convenient for nanometre-scale cascade visualization.
+ELECTRON_REST_ENERGY_EV = 510_998.95069
+LIGHT_SPEED_ANGSTROM_PER_FS = 2_997.92458
+
 
 def _vec3(values) -> Vec3:
     """Store directions and positions as immutable, serialization-safe triples."""
@@ -1103,6 +1109,22 @@ def _vec3(values) -> Vec3:
 
 def _dot3(a, b):
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _flight_time_fs(distance_angstrom, kinetic_energy_ev):
+    """Relativistic free-flight time without changing transport physics."""
+    distance = float(distance_angstrom)
+    energy = float(kinetic_energy_ev)
+    if distance <= 0.0:
+        return 0.0
+    if energy <= 0.0 or not math.isfinite(energy):
+        return 0.0
+    gamma = 1.0 + energy / ELECTRON_REST_ENERGY_EV
+    beta_squared = max(1.0 - 1.0 / (gamma * gamma), 0.0)
+    if beta_squared == 0.0:
+        return 0.0
+    speed = LIGHT_SPEED_ANGSTROM_PER_FS * math.sqrt(beta_squared)
+    return distance / speed
 
 
 @dataclass
@@ -1117,6 +1139,7 @@ class HistoryEvent:
     energy_after: float
     direction_before: Vec3
     direction_after: Vec3
+    time_fs: float = field(default=0.0, compare=False)
     step_length: float = 0.0
     scattering_angle: Optional[float] = None
     azimuth: Optional[float] = None
@@ -1153,6 +1176,7 @@ class ElectronRecord:
     parent_direction_before: Optional[Vec3] = None
     parent_direction_after: Optional[Vec3] = None
     sampled_channel: Optional[str] = None
+    birth_time_fs: float = field(default=0.0, compare=False)
     elastic_events: int = 0
     inelastic_events: int = 0
     surface_encounters: int = 0
@@ -1168,6 +1192,7 @@ class ElectronRecord:
     final_position: Optional[Vec3] = None
     final_energy: Optional[float] = None
     final_direction: Optional[Vec3] = None
+    final_time_fs: Optional[float] = field(default=None, compare=False)
 
 
 @dataclass
@@ -1178,6 +1203,7 @@ class TrajectoryHistory:
     incident_angle: float
     incident_direction: Vec3
     launch_position: Vec3
+    reference_surface_normal: Vec3
     trajectory_id: Optional[int] = None
     electrons: list = field(default_factory=list)
     events: list = field(default_factory=list)
@@ -1209,6 +1235,7 @@ class TrajectoryHistory:
             "incident_angle": self.incident_angle,
             "incident_direction": self.incident_direction,
             "launch_position": self.launch_position,
+            "reference_surface_normal": self.reference_surface_normal,
             "trajectory_id": self.trajectory_id,
             "electrons": self.electron_rows(),
             "events": self.event_rows(),
@@ -1262,6 +1289,7 @@ class _HistoryRecorder:
             incident_angle=float(incident_angle),
             incident_direction=_vec3(incident_direction),
             launch_position=_vec3(launch_position),
+            reference_surface_normal=_vec3(reference_surface_normal),
             trajectory_id=trajectory_id,
         )
         self._next_electron_id = 0
@@ -1310,6 +1338,7 @@ class _HistoryRecorder:
             energy_after=float(energy),
             direction_before=_vec3(direction),
             direction_after=_vec3(direction),
+            time_fs=0.0,
             outcome="queued",
         )
         record = ElectronRecord(
@@ -1323,6 +1352,7 @@ class _HistoryRecorder:
             birth_energy=float(energy),
             birth_direction=_vec3(direction),
             birth_mechanism="incident_primary",
+            birth_time_fs=0.0,
             maximum_depth=(
                 self.geometry.depth_into_solid(position)
                 if hasattr(self.geometry, "depth_into_solid")
@@ -1345,6 +1375,7 @@ class _HistoryRecorder:
             energy_after=float(secondary.energy),
             direction_before=_vec3(secondary.uvw),
             direction_after=_vec3(secondary.uvw),
+            time_fs=float(parent.time_fs),
             sampled_channel=secondary.sampled_channel,
             mechanism=secondary.mechanism,
             outcome="created",
@@ -1366,6 +1397,7 @@ class _HistoryRecorder:
             parent_direction_before=secondary.parent_direction_before,
             parent_direction_after=secondary.parent_direction_after,
             sampled_channel=secondary.sampled_channel,
+            birth_time_fs=float(parent.time_fs),
             maximum_depth=(
                 self.geometry.depth_into_solid(secondary.xyz)
                 if hasattr(self.geometry, "depth_into_solid")
@@ -1391,6 +1423,7 @@ class _HistoryRecorder:
             energy_after=float(electron.energy),
             direction_before=_vec3(direction_before),
             direction_after=_vec3(electron.uvw),
+            time_fs=float(electron.time_fs),
             step_length=float(electron.last_step_length),
             scattering_angle=float(scattering_angle),
             azimuth=float(azimuth),
@@ -1438,6 +1471,7 @@ class _HistoryRecorder:
             energy_after=float(electron.energy),
             direction_before=_vec3(direction_before),
             direction_after=_vec3(electron.uvw),
+            time_fs=float(electron.time_fs),
             step_length=float(electron.last_step_length),
             outcome="escaped" if escaped else "reflected",
             surface_id=None if hit is None else hit.surface_id,
@@ -1459,6 +1493,7 @@ class _HistoryRecorder:
         record.final_position = record.birth_position
         record.final_energy = record.birth_energy
         record.final_direction = record.birth_direction
+        record.final_time_fs = record.birth_time_fs
         self._event(
             electron_id=electron_id,
             kind="termination",
@@ -1467,6 +1502,7 @@ class _HistoryRecorder:
             energy_after=record.birth_energy,
             direction_before=record.birth_direction,
             direction_after=record.birth_direction,
+            time_fs=record.birth_time_fs,
             outcome=fate,
         )
 
@@ -1477,6 +1513,7 @@ class _HistoryRecorder:
         record.final_position = _vec3(electron.xyz)
         record.final_energy = float(electron.energy)
         record.final_direction = _vec3(electron.uvw)
+        record.final_time_fs = float(electron.time_fs)
         self._observe(record, electron.xyz)
         if record.fate != "emitted":
             self._event(
@@ -1487,6 +1524,7 @@ class _HistoryRecorder:
                 energy_after=record.final_energy,
                 direction_before=record.final_direction,
                 direction_after=record.final_direction,
+                time_fs=record.final_time_fs,
                 outcome=record.fate,
             )
 
@@ -1500,7 +1538,8 @@ class Electron:
     def __init__(self, sample: Sample, energy, xyz, uvw, generation=0,
                  is_cascade=False, rng=None, save_coordinates=False,
                  electron_id=-1, parent_id=None, root_primary_id=None,
-                 history=None, geometry=None, current_region=None):
+                 history=None, geometry=None, current_region=None,
+                 birth_time_fs=0.0):
         self.sample = sample
         self.cfg = sample.cfg
         self.rng = rng
@@ -1538,8 +1577,10 @@ class Electron:
         self.path_length = 0.0
         self.last_step_length = 0.0
         self.last_surface_hit = None
+        self.time_fs = float(birth_time_fs)
         self.save_coordinates = bool(save_coordinates)
         self.coordinates = []
+        self.coordinate_times_fs = []
         self._record()
 
         self.Ui = sample.Ui
@@ -1550,6 +1591,7 @@ class Electron:
     def _record(self):
         if self.save_coordinates:
             self.coordinates.append([round(v, 3) for v in self.xyz] + [round(self.energy, 3)])
+            self.coordinate_times_fs.append(self.time_fs)
 
     def refresh_rates(self):
         """Evaluate the inverse MFPs once per step and cache them."""
@@ -1608,6 +1650,8 @@ class Electron:
 
         self.path_length += s
         self.last_step_length = s
+        if self.save_coordinates:
+            self.time_fs += _flight_time_fs(s, self.energy)
         self.xyz[0] += self.uvw[0] * s
         self.xyz[1] += self.uvw[1] * s
         self.xyz[2] += self.uvw[2] * s
@@ -1917,6 +1961,8 @@ class TrajectoryResult:
     emissions: list = field(default_factory=list)
     birth_depths: list = field(default_factory=list)
     tracks: list = field(default_factory=list)
+    track_times_fs: list = field(default_factory=list, compare=False)
+    track_electron_ids: list = field(default_factory=list)
     diagnostics: Diagnostics = field(default_factory=Diagnostics)
     history: Optional[TrajectoryHistory] = None
 
@@ -2092,7 +2138,7 @@ def simulate_trajectory(sample: Sample, E0, angle_rad, rng, track=False,
                       save_coordinates=track, electron_id=primary_id,
                       parent_id=None, root_primary_id=primary_id,
                       history=recorder, geometry=geometry,
-                      current_region=initial_region)]
+                      current_region=initial_region, birth_time_fs=0.0)]
 
     i = 0
     while i < len(queue):
@@ -2200,11 +2246,14 @@ def simulate_trajectory(sample: Sample, E0, angle_rad, rng, track=False,
                          rng=rng, save_coordinates=track,
                          electron_id=secondary_id, parent_id=e.electron_id,
                          root_primary_id=e.root_primary_id, history=recorder,
-                         geometry=geometry, current_region=e.current_region)
+                         geometry=geometry, current_region=e.current_region,
+                         birth_time_fs=e.time_fs)
             )
 
         if track:
             res.tracks.append(e.coordinates)
+            res.track_times_fs.append(e.coordinate_times_fs)
+            res.track_electron_ids.append(e.electron_id)
         if recorder is not None:
             recorder.finalize_electron(e)
         queue[i] = None            # release the cascade as we go

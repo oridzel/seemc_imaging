@@ -29,12 +29,37 @@ from .transport import (
 
 from .raster import (
     CHANNEL_DEFINITIONS,
+    DISJOINT_POPULATION_CHANNELS,
+    LEGACY_CHANNEL_DEFINITIONS,
+    LEGACY_DISJOINT_POPULATION_CHANNELS,
+    LEGACY_POPULATION_CHANNELS,
     POPULATION_CHANNELS,
     PopulationClassifier,
     RasterConfig,
     RasterDriver,
     RasterResult,
     sample_beam_reference,
+)
+
+from .trajectory import (
+    POINT_COLUMNS,
+    RasterTrajectoryArchive,
+    TRAJECTORY_FORMAT,
+)
+from .animation import animate_trapezoidal_scan
+
+from .metrology import (
+    DEFAULT_CHANNEL_SETS,
+    LEGACY_CHANNEL_SETS,
+    InformationResult,
+    PARAMETER_NAMES,
+    ProfileFitResult,
+    ProfileFitter,
+    ProfileObservation,
+    TrapezoidModelLibrary,
+    TrapezoidSweepConfig,
+    TrapezoidSweepDriver,
+    compare_channel_information,
 )
 
 __all__ = [
@@ -45,12 +70,24 @@ __all__ = [
     "HistoryEvent",
     "MCConfig",
     "CHANNEL_DEFINITIONS",
+    "DEFAULT_CHANNEL_SETS",
+    "LEGACY_CHANNEL_SETS",
+    "DISJOINT_POPULATION_CHANNELS",
+    "LEGACY_CHANNEL_DEFINITIONS",
+    "LEGACY_DISJOINT_POPULATION_CHANNELS",
+    "LEGACY_POPULATION_CHANNELS",
     "POPULATION_CHANNELS",
     "Plane",
+    "InformationResult",
+    "PARAMETER_NAMES",
     "PopulationClassifier",
+    "ProfileFitResult",
+    "ProfileFitter",
+    "ProfileObservation",
     "RasterConfig",
     "RasterDriver",
     "RasterResult",
+    "RasterTrajectoryArchive",
     "Scene",
     "SEEMC",
     "SOLID_REGION",
@@ -59,13 +96,20 @@ __all__ = [
     "SurfaceHit",
     "TrapezoidalLine",
     "TrapezoidalPrism",
+    "TrapezoidModelLibrary",
+    "TrapezoidSweepConfig",
+    "TrapezoidSweepDriver",
     "TrajectoryHistory",
     "TrajectoryResult",
+    "TRAJECTORY_FORMAT",
     "VACUUM_REGION",
     "incident_direction",
     "refract_incident_direction",
     "simulate_trajectory",
     "sample_beam_reference",
+    "compare_channel_information",
+    "animate_trapezoidal_scan",
+    "POINT_COLUMNS",
 ]
 
-__version__ = "0.4.0"
+__version__ = "0.7.0"

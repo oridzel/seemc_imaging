@@ -1,7 +1,7 @@
 # Provenance and event history
 
 The history layer stores observations, not population labels. In particular,
-SE1, SE2, BSE1, and BSE2 are not assigned during transport. This keeps the
+SE1, SE2, LLE/non-LLE, and first-event BSE are not assigned during transport. This keeps the
 validated physics kernel independent of definitions that we may want to refine
 or compare later.
 
@@ -16,6 +16,9 @@ Each `ElectronRecord` stores:
 - `electron_id`, `parent_id`, and `root_primary_id`;
 - generation and original-primary status;
 - complete birth position, energy, and direction;
+- the launch-surface outward normal used as the branch reference;
+- physical birth and final time in femtoseconds when trajectory timing is
+  requested;
 - parent energy and direction immediately before and after the birth collision;
 - sampled table channel and physical creation mechanism;
 - elastic/inelastic event counts and surface encounters;
@@ -42,7 +45,8 @@ especially at oblique incidence.
 | `termination` | Absorption, configured limit, invalid state, or no rate |
 
 Each collision stores the position, free-flight length, energy and direction
-before and after, polar scattering angle, and azimuth. Inelastic events also
+before and after, elapsed femtoseconds, polar scattering angle, and azimuth.
+Inelastic events also
 store energy loss, momentum transfer, sampled channel, physical mechanism, and
 the created child ID when applicable.
 
@@ -72,11 +76,13 @@ A post-processing classifier can determine, without rerunning transport:
 - whether a secondary's parent was the original primary or a cascade electron;
 - whether that parent was still on its incident branch or had already reversed;
 - which collision created the secondary and by which mechanism;
-- whether an emitted primary returned after one decisive elastic event or a
-  multiple-scattering history;
+- whether an emitted primary returned on its first completed collision or a
+  later scattering history;
 - emission energy, full direction, birth depth, maximum depth, lateral spread,
   and path length;
+- vacuum energy loss of the emitted original primary;
 - alternative energy-cut definitions alongside ancestry definitions.
 
-That is sufficient to prototype several SE1/SE2 and BSE1/BSE2 definitions while
+That is sufficient to compare causal SE1/SE2, LLE/non-LLE, strict first-event
+BSE, scattering-order, and legacy definitions while
 preserving the raw data used by every definition.

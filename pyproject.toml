@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "seemc-imaging"
-version = "0.4.0"
+version = "0.7.0"
 description = "Population-resolved Monte Carlo electron transport for SEM image formation"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -18,6 +18,7 @@ dependencies = [
 [project.optional-dependencies]
 parallel = ["tqdm>=4.60"]
 plot = ["matplotlib>=3.7"]
+animation = ["matplotlib>=3.7", "pillow>=10"]
 dev = ["pytest>=8", "build>=1"]
 
 [tool.setuptools.packages.find]

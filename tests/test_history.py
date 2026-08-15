@@ -117,6 +117,6 @@ def test_history_serializes_to_plain_python_rows(tmp_path):
     )
     payload = result.history.to_dict()
     assert payload["incident_energy"] == 500.0
+    assert payload["reference_surface_normal"] == (0.0, 0.0, -1.0)
     assert payload["events"][0]["kind"] == "primary_launch"
     assert payload["electrons"][0]["birth_mechanism"] == "incident_primary"
-

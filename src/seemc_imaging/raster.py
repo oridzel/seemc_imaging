@@ -22,12 +22,13 @@ from typing import Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from .transport import Sample, TrajectoryResult, simulate_trajectory
+from .trajectory import RasterTrajectoryArchive
 
 
 FWHM_TO_SIGMA = 1.0 / (2.0 * math.sqrt(2.0 * math.log(2.0)))
 
 
-CHANNEL_DEFINITIONS = {
+BASE_CHANNEL_DEFINITIONS = {
     "tey": "All emitted electrons.",
     "sey_50ev": "Emitted electrons below the configured energy cutoff.",
     "bse_50ev": "Emitted electrons at or above the configured energy cutoff.",
@@ -47,25 +48,88 @@ CHANNEL_DEFINITIONS = {
     ),
     "generation_1": "Emitted cascade electrons with generation == 1.",
     "generation_2plus": "Emitted cascade electrons with generation >= 2.",
+}
+
+CAUSAL_LLE_CHANNEL_DEFINITIONS = {
     "se1": (
-        "branch_v1: low-energy cascade emission born before the incident "
-        "primary first turned toward the launch surface."
+        "causal_lle_v2: low-energy cascade emission created while its "
+        "immediate energetic parent was directed into the launch surface."
     ),
     "se2": (
-        "branch_v1: low-energy cascade emission born after the incident "
-        "primary first turned toward the launch surface."
+        "causal_lle_v2: low-energy cascade emission created while its "
+        "immediate energetic parent was directed toward vacuum through the "
+        "launch surface."
     ),
-    "bse1": (
-        "branch_v1: emitted incident primary whose first turn toward the "
-        "surface was caused by its first elastic collision."
+    "lle_primary": (
+        "causal_lle_v2: emitted original incident electron with vacuum "
+        "energy loss no greater than the configured LLE threshold."
     ),
-    "bse2": (
-        "branch_v1: every other emitted incident primary, including "
-        "multiple-scattering returns."
+    "non_lle_primary": (
+        "causal_lle_v2: emitted original incident electron with vacuum "
+        "energy loss greater than the configured LLE threshold."
+    ),
+    "first_event_bse": (
+        "Diagnostic: emitted original incident electron whose first completed "
+        "collision was an elastic event that turned it toward the launch "
+        "surface."
+    ),
+    "later_return_bse": (
+        "Diagnostic complement of first_event_bse: every other emitted "
+        "original incident electron."
     ),
 }
 
+LEGACY_BRANCH_V1_CHANNEL_DEFINITIONS = {
+    "se1": (
+        "legacy branch_v1: low-energy cascade emission born before the "
+        "incident primary first turned toward the launch surface."
+    ),
+    "se2": (
+        "legacy branch_v1: low-energy cascade emission born after the "
+        "incident primary first turned toward the launch surface."
+    ),
+    "bse1": (
+        "legacy branch_v1: emitted incident primary whose first turn toward "
+        "the surface was caused by its first elastic collision."
+    ),
+    "bse2": (
+        "legacy branch_v1: every other emitted incident primary."
+    ),
+}
+
+# Public defaults describe the current classifier.  The legacy constants remain
+# available through PopulationClassifier(definition="branch_v1") so archived
+# 0.6.x calculations can be reproduced exactly.
+CHANNEL_DEFINITIONS = {
+    **BASE_CHANNEL_DEFINITIONS,
+    **CAUSAL_LLE_CHANNEL_DEFINITIONS,
+}
+LEGACY_CHANNEL_DEFINITIONS = {
+    **BASE_CHANNEL_DEFINITIONS,
+    **LEGACY_BRANCH_V1_CHANNEL_DEFINITIONS,
+}
+
 POPULATION_CHANNELS = tuple(CHANNEL_DEFINITIONS)
+LEGACY_POPULATION_CHANNELS = tuple(LEGACY_CHANNEL_DEFINITIONS)
+
+# This basis partitions every emitted electron exactly once.  It is therefore
+# safe for covariance-aware joint fits, unlike overlapping collections such as
+# (TEY, SEY, BSE, SE1, SE2).
+DISJOINT_POPULATION_CHANNELS = (
+    "se1",
+    "se2",
+    "fast_cascade_ge50",
+    "lle_primary",
+    "non_lle_primary",
+)
+
+LEGACY_DISJOINT_POPULATION_CHANNELS = (
+    "se1",
+    "se2",
+    "fast_cascade_ge50",
+    "bse1",
+    "bse2",
+)
 
 
 def _vec3(values, name):
@@ -133,33 +197,80 @@ def _pair(values, name, *, nonnegative=False):
 class PopulationClassifier:
     """Post-process one cascade into overlapping physical signal channels.
 
-    ``branch_v1`` is an operational definition, not a claim that SE1/SE2 or
-    BSE1/BSE2 have one universal definition in the SEM literature.  The
-    energy-cut and ancestry channels remain available alongside it.
+    The default ``causal_lle_v2`` definition deliberately separates taxonomy
+    from expected spatial behavior and detector filtering:
+
+    * SE1/SE2 are classified from the direction of the immediate energetic
+      parent at the creating collision, not from where the child was born;
+    * LLE/non-LLE is an explicit vacuum-energy-loss partition of emitted
+      original primaries;
+    * strict first-event BSE is retained as an overlapping diagnostic rather
+      than identified with LLE or used in the default fitting basis.
+
+    ``branch_v1`` reproduces the 0.6.x operational labels for legacy studies.
     """
 
     bse_cutoff_ev: float = 50.0
-    definition: str = "branch_v1"
+    lle_max_loss_ev: float = 50.0
+    definition: str = "causal_lle_v2"
 
     def __post_init__(self):
         cutoff = float(self.bse_cutoff_ev)
         if not math.isfinite(cutoff) or cutoff < 0.0:
             raise ValueError("bse_cutoff_ev must be finite and non-negative")
-        if self.definition != "branch_v1":
-            raise ValueError("only definition='branch_v1' is currently supported")
+        lle_loss = float(self.lle_max_loss_ev)
+        if not math.isfinite(lle_loss) or lle_loss < 0.0:
+            raise ValueError("lle_max_loss_ev must be finite and non-negative")
+        if self.definition not in {"causal_lle_v2", "branch_v1"}:
+            raise ValueError(
+                "definition must be 'causal_lle_v2' or legacy 'branch_v1'"
+            )
         object.__setattr__(self, "bse_cutoff_ev", cutoff)
+        object.__setattr__(self, "lle_max_loss_ev", lle_loss)
 
     @property
     def channels(self):
+        if self.definition == "branch_v1":
+            return LEGACY_POPULATION_CHANNELS
         return POPULATION_CHANNELS
 
     @property
     def definitions(self):
-        return dict(CHANNEL_DEFINITIONS)
+        if self.definition == "branch_v1":
+            return dict(LEGACY_CHANNEL_DEFINITIONS)
+        definitions = dict(CHANNEL_DEFINITIONS)
+        threshold = f"{self.lle_max_loss_ev:g} eV"
+        definitions["lle_primary"] += f" Threshold: {threshold}."
+        definitions["non_lle_primary"] += f" Threshold: {threshold}."
+        return definitions
+
+    @property
+    def disjoint_channels(self):
+        if self.definition == "branch_v1":
+            return LEGACY_DISJOINT_POPULATION_CHANNELS
+        return DISJOINT_POPULATION_CHANNELS
+
+    def to_dict(self):
+        return {
+            "definition": self.definition,
+            "bse_cutoff_ev": self.bse_cutoff_ev,
+            "lle_max_loss_ev": (
+                self.lle_max_loss_ev
+                if self.definition == "causal_lle_v2" else None
+            ),
+            "se_reference": (
+                "immediate_parent_direction_vs_launch_surface_normal"
+                if self.definition == "causal_lle_v2"
+                else "root_primary_first_surface_return_event"
+            ),
+            "energy_reference": "vacuum",
+        }
 
     def classify(self, result: TrajectoryResult):
         if result.history is None:
-            raise ValueError("branch_v1 classification requires trajectory history")
+            raise ValueError(
+                f"{self.definition} classification requires trajectory history"
+            )
         if len(result.emissions) != result.tey:
             raise ValueError(
                 "complete emission records are required; use "
@@ -192,22 +303,119 @@ class PopulationClassifier:
             e.is_cascade and e.generation >= 2 for e in result.emissions
         )
 
+        labels = self.emission_labels(result)
+        for label in labels.values():
+            if label != "fast_cascade_ge50":
+                counts[label] += 1
+
+        if counts["tey"] != counts["sey_50ev"] + counts["bse_50ev"]:
+            raise RuntimeError("energy-cut population channels do not partition TEY")
+        if counts["tey"] != counts["cascade_all"] + counts["primary_all"]:
+            raise RuntimeError("ancestry population channels do not partition TEY")
+        if counts["se_cascade_lt50"] != counts["se1"] + counts["se2"]:
+            raise RuntimeError("causal SE channels are incomplete")
+        if self.definition == "branch_v1":
+            if counts["primary_all"] != counts["bse1"] + counts["bse2"]:
+                raise RuntimeError("legacy branch_v1 BSE channels are incomplete")
+        else:
+            if counts["primary_all"] != (
+                    counts["lle_primary"] + counts["non_lle_primary"]):
+                raise RuntimeError("LLE channels do not partition emitted primaries")
+            first_event, later_return = self._first_event_bse_counts(result)
+            counts["first_event_bse"] = first_event
+            counts["later_return_bse"] = later_return
+            if counts["primary_all"] != first_event + later_return:
+                raise RuntimeError(
+                    "first-event diagnostic channels do not partition primaries"
+                )
+        return counts
+
+    def emission_labels(self, result: TrajectoryResult):
+        """Return the disjoint population label for each emitted electron."""
+        if result.history is None:
+            raise ValueError(
+                f"{self.definition} classification requires trajectory history"
+            )
+        if len(result.emissions) != result.tey:
+            raise ValueError(
+                "complete emission records are required; use "
+                "MCConfig(collect_spectra=True)"
+            )
+
+        if self.definition == "branch_v1":
+            return self._legacy_emission_labels(result)
+        return self._causal_lle_emission_labels(result)
+
+    @staticmethod
+    def _root_record(history):
+        roots = [record for record in history.electrons if record.parent_id is None]
+        if len(roots) != 1:
+            raise ValueError("population classification expects one incident primary")
+        return roots[0]
+
+    def _causal_lle_emission_labels(self, result):
+        history = result.history
+        records = {record.electron_id: record for record in history.electrons}
+        normal = tuple(float(value) for value in history.reference_surface_normal)
+        labels = {}
+        for emission in result.emissions:
+            if emission.is_cascade and emission.energy < self.bse_cutoff_ev:
+                record = records[emission.electron_id]
+                if record.parent_direction_before is None:
+                    raise ValueError(
+                        "causal SE classification requires the immediate parent "
+                        "direction at the birth collision"
+                    )
+                parent_outward = _dot(record.parent_direction_before, normal) > 0.0
+                labels[emission.electron_id] = "se2" if parent_outward else "se1"
+            elif emission.is_cascade:
+                labels[emission.electron_id] = "fast_cascade_ge50"
+            else:
+                energy_loss = max(
+                    0.0, float(history.incident_energy) - float(emission.energy)
+                )
+                labels[emission.electron_id] = (
+                    "lle_primary"
+                    if energy_loss <= self.lle_max_loss_ev
+                    else "non_lle_primary"
+                )
+        return labels
+
+    def _first_event_bse_counts(self, result):
+        history = result.history
+        root = self._root_record(history)
+        primary_count = sum(not emission.is_cascade for emission in result.emissions)
+        if primary_count == 0:
+            return 0, 0
+        collisions = [
+            event for event in history.events
+            if event.electron_id == root.electron_id
+            and event.kind in {"elastic", "inelastic"}
+        ]
+        first_event = bool(
+            collisions
+            and root.first_surface_return_event_id == collisions[0].event_id
+            and collisions[0].kind == "elastic"
+        )
+        return (primary_count, 0) if first_event else (0, primary_count)
+
+    def _legacy_emission_labels(self, result):
         history = result.history
         records = {record.electron_id: record for record in history.electrons}
         events = {event.event_id: event for event in history.events}
-        roots = [record for record in history.electrons if record.parent_id is None]
-        if len(roots) != 1:
-            raise ValueError("branch_v1 expects exactly one incident primary")
-        root = roots[0]
+        root = self._root_record(history)
         return_event = root.first_surface_return_event_id
 
+        labels = {}
         for emission in result.emissions:
-            if emission.is_cascade and emission.energy < cutoff:
+            if emission.is_cascade and emission.energy < self.bse_cutoff_ev:
                 record = records[emission.electron_id]
                 if return_event is not None and return_event < record.birth_event_id:
-                    counts["se2"] += 1
+                    labels[emission.electron_id] = "se2"
                 else:
-                    counts["se1"] += 1
+                    labels[emission.electron_id] = "se1"
+            elif emission.is_cascade:
+                labels[emission.electron_id] = "fast_cascade_ge50"
 
         primary_emissions = [e for e in result.emissions if not e.is_cascade]
         if primary_emissions:
@@ -219,24 +427,16 @@ class PopulationClassifier:
                     and event.event_id <= return_event
                     for event in history.events
                 )
-            if (
-                return_event is not None
+            label = (
+                "bse1"
+                if return_event is not None
                 and events[return_event].kind == "elastic"
                 and elastic_before_return == 1
-            ):
-                counts["bse1"] = len(primary_emissions)
-            else:
-                counts["bse2"] = len(primary_emissions)
-
-        if counts["tey"] != counts["sey_50ev"] + counts["bse_50ev"]:
-            raise RuntimeError("energy-cut population channels do not partition TEY")
-        if counts["tey"] != counts["cascade_all"] + counts["primary_all"]:
-            raise RuntimeError("ancestry population channels do not partition TEY")
-        if counts["se_cascade_lt50"] != counts["se1"] + counts["se2"]:
-            raise RuntimeError("branch_v1 SE channels are incomplete")
-        if counts["primary_all"] != counts["bse1"] + counts["bse2"]:
-            raise RuntimeError("branch_v1 BSE channels are incomplete")
-        return counts
+                else "bse2"
+            )
+            for emission in primary_emissions:
+                labels[emission.electron_id] = label
+        return labels
 
 
 @dataclass(frozen=True)
@@ -254,6 +454,10 @@ class RasterConfig:
     beam_fwhm: object = 0.0
     vacuum_direction: Tuple[float, float, float] = (0.0, 0.0, 1.0)
     seed: int = 12345
+    record_trajectories: bool = False
+    record_primaries_per_pixel: Optional[int] = None
+    trajectory_stride: int = 1
+    trajectory_max_points: Optional[int] = None
 
     def __post_init__(self):
         energy = float(self.energy_ev)
@@ -274,6 +478,30 @@ class RasterConfig:
                 "positive global z component"
             )
         seed = int(self.seed)
+        record = bool(self.record_trajectories)
+        record_n = self.record_primaries_per_pixel
+        if record:
+            raw_record_n = n if record_n is None else record_n
+            record_n = int(raw_record_n)
+            if record_n != raw_record_n or record_n < 1 or record_n > n:
+                raise ValueError(
+                    "record_primaries_per_pixel must be between 1 and "
+                    "primaries_per_pixel and must be an integer"
+                )
+        else:
+            if record_n not in (None, 0):
+                raise ValueError(
+                    "record_primaries_per_pixel requires record_trajectories=True"
+                )
+            record_n = 0
+        stride = int(self.trajectory_stride)
+        if stride < 1 or stride != self.trajectory_stride:
+            raise ValueError("trajectory_stride must be a positive integer")
+        max_points = self.trajectory_max_points
+        if max_points is not None:
+            max_points = int(max_points)
+            if max_points < 2 or max_points != self.trajectory_max_points:
+                raise ValueError("trajectory_max_points must be at least 2")
         object.__setattr__(self, "energy_ev", energy)
         object.__setattr__(self, "x_positions", x)
         object.__setattr__(self, "y_positions", y)
@@ -281,6 +509,10 @@ class RasterConfig:
         object.__setattr__(self, "beam_fwhm", fwhm)
         object.__setattr__(self, "vacuum_direction", direction)
         object.__setattr__(self, "seed", seed)
+        object.__setattr__(self, "record_trajectories", record)
+        object.__setattr__(self, "record_primaries_per_pixel", record_n)
+        object.__setattr__(self, "trajectory_stride", stride)
+        object.__setattr__(self, "trajectory_max_points", max_points)
 
     @property
     def shape(self):
@@ -303,6 +535,10 @@ class RasterConfig:
             "beam_fwhm_angstrom": list(self.beam_fwhm),
             "vacuum_direction": list(self.vacuum_direction),
             "seed": self.seed,
+            "record_trajectories": self.record_trajectories,
+            "record_primaries_per_pixel": self.record_primaries_per_pixel,
+            "trajectory_stride": self.trajectory_stride,
+            "trajectory_max_points": self.trajectory_max_points,
         }
 
 
@@ -344,6 +580,40 @@ def _add_diagnostics(target, values):
         target[key] = target.get(key, 0) + int(value)
 
 
+def _decimate_track(coordinates, times_fs, stride, max_points):
+    coordinates = np.asarray(coordinates, dtype=float)
+    times_fs = np.asarray(times_fs, dtype=float)
+    if len(coordinates) != len(times_fs):
+        raise ValueError("trajectory coordinates and times must have equal length")
+    if len(coordinates) == 0:
+        return np.empty((0, 5), dtype=float)
+    indices = np.arange(0, len(coordinates), int(stride), dtype=int)
+    if indices[-1] != len(coordinates) - 1:
+        indices = np.append(indices, len(coordinates) - 1)
+    if max_points is not None and len(indices) > max_points:
+        selected = np.rint(np.linspace(0, len(indices) - 1, max_points)).astype(int)
+        indices = indices[np.unique(selected)]
+    return np.column_stack((coordinates[indices], times_fs[indices]))
+
+
+def _geometry_metadata(geometry):
+    metadata = {"type": type(geometry).__name__}
+    for name in (
+        "top_width", "bottom_width", "height", "center_x", "substrate_z",
+        "surface_id", "solid_region", "vacuum_region",
+    ):
+        if hasattr(geometry, name):
+            value = getattr(geometry, name)
+            metadata[name] = float(value) if isinstance(value, (int, float)) else str(value)
+    if hasattr(geometry, "point"):
+        metadata["point"] = [float(value) for value in geometry.point]
+    if hasattr(geometry, "outward_normal"):
+        metadata["outward_normal"] = [
+            float(value) for value in geometry.outward_normal
+        ]
+    return metadata
+
+
 def _simulate_pixel(sample, geometry, config, classifier, task):
     pixel_id, iy, ix, x, y = task
     n = config.primaries_per_pixel
@@ -352,6 +622,7 @@ def _simulate_pixel(sample, geometry, config, classifier, task):
     launch_values = np.zeros((n, 4), dtype=np.float64)
     surface_counts = {}
     diagnostics = {}
+    trajectory_records = []
     z_reference = _reference_z(geometry)
 
     for trajectory_id in range(n):
@@ -376,11 +647,16 @@ def _simulate_pixel(sample, geometry, config, classifier, task):
         )
         local_angle = math.acos(local_cosine)
 
+        record_track = (
+            config.record_trajectories
+            and trajectory_id < config.record_primaries_per_pixel
+        )
         result = simulate_trajectory(
             sample,
             config.energy_ev,
             local_angle,
             transport_rng,
+            track=record_track,
             history=True,
             trajectory_id=trajectory_id,
             geometry=geometry,
@@ -395,9 +671,52 @@ def _simulate_pixel(sample, geometry, config, classifier, task):
         )
         surface_counts[hit.surface_id] = surface_counts.get(hit.surface_id, 0) + 1
         _add_diagnostics(diagnostics, result.diagnostics)
+        if record_track:
+            records_by_id = {
+                record.electron_id: record for record in result.history.electrons
+            }
+            labels = classifier.emission_labels(result)
+            electrons = []
+            for electron_id, coordinates, times_fs in zip(
+                result.track_electron_ids, result.tracks, result.track_times_fs
+            ):
+                record = records_by_id[electron_id]
+                population = labels.get(
+                    electron_id,
+                    "primary_absorbed" if record.is_primary else "cascade_absorbed",
+                )
+                electrons.append({
+                    "electron_id": int(electron_id),
+                    "parent_id": record.parent_id,
+                    "generation": int(record.generation),
+                    "is_primary": bool(record.is_primary),
+                    "birth_energy_ev": float(record.birth_energy),
+                    "birth_time_fs": float(record.birth_time_fs),
+                    "fate": str(record.fate),
+                    "final_energy_ev": float(record.final_energy),
+                    "final_direction": tuple(record.final_direction),
+                    "population": population,
+                    "points": _decimate_track(
+                        coordinates,
+                        times_fs,
+                        config.trajectory_stride,
+                        config.trajectory_max_points,
+                    ),
+                })
+            trajectory_records.append({
+                "pixel_id": int(pixel_id),
+                "iy": int(iy),
+                "ix": int(ix),
+                "trajectory_id": int(trajectory_id),
+                "nominal_xy_angstrom": (float(x), float(y)),
+                "launch_xyz_angstrom": tuple(hit.position),
+                "local_incidence_rad": float(local_angle),
+                "electrons": electrons,
+            })
 
     channel_sum = channel_values.sum(axis=0)
     channel_sum_sq = np.square(channel_values).sum(axis=0)
+    channel_cross_sum = channel_values.T @ channel_values
     launch_sum = launch_values.sum(axis=0)
     launch_sum_sq = np.square(launch_values).sum(axis=0)
     return {
@@ -406,10 +725,12 @@ def _simulate_pixel(sample, geometry, config, classifier, task):
         "ix": ix,
         "channel_sum": channel_sum,
         "channel_sum_sq": channel_sum_sq,
+        "channel_cross_sum": channel_cross_sum,
         "launch_sum": launch_sum,
         "launch_sum_sq": launch_sum_sq,
         "surface_counts": surface_counts,
         "diagnostics": diagnostics,
+        "trajectory_records": trajectory_records,
     }
 
 
@@ -447,6 +768,8 @@ class RasterResult:
     yield_maps: Mapping[str, np.ndarray]
     sem_maps: Mapping[str, np.ndarray]
     count_maps: Mapping[str, np.ndarray]
+    primary_count_covariance: np.ndarray
+    yield_covariance: np.ndarray
     completed_primaries: np.ndarray
     launch_mean: np.ndarray
     launch_sem: np.ndarray
@@ -454,6 +777,8 @@ class RasterResult:
     local_incidence_sem_rad: np.ndarray
     surface_hit_counts: Mapping[str, np.ndarray] = field(default_factory=dict)
     diagnostics: Mapping[str, int] = field(default_factory=dict)
+    geometry_metadata: Mapping[str, object] = field(default_factory=dict)
+    trajectory_records: Sequence[dict] = field(default_factory=tuple)
 
     @property
     def x_positions(self):
@@ -470,15 +795,62 @@ class RasterResult:
             for name, values in self.surface_hit_counts.items()
         }
 
+    @property
+    def covariance_channels(self):
+        return tuple(self.classifier.channels)
+
+    @property
+    def has_recorded_trajectories(self):
+        return bool(self.trajectory_records)
+
+    def covariance(self, channels=None, *, of_mean=True):
+        """Return per-pixel covariance for a selected channel collection.
+
+        The last two axes follow ``channels``.  ``of_mean=True`` returns the
+        covariance of the reported pixel yields; otherwise it returns the
+        sample covariance of the per-primary emitted counts.
+        """
+        channels = tuple(channels or self.covariance_channels)
+        unknown = [name for name in channels if name not in self.covariance_channels]
+        if unknown:
+            raise KeyError(f"unknown covariance channels: {unknown}")
+        indices = [self.covariance_channels.index(name) for name in channels]
+        source = self.yield_covariance if of_mean else self.primary_count_covariance
+        return np.take(np.take(source, indices, axis=-2), indices, axis=-1)
+
+    def correlation(self, channels=None):
+        """Return per-pixel correlation matrices of per-primary counts."""
+        covariance = self.covariance(channels, of_mean=False)
+        standard = np.sqrt(np.maximum(np.diagonal(
+            covariance, axis1=-2, axis2=-1
+        ), 0.0))
+        denominator = standard[..., :, None] * standard[..., None, :]
+        return np.divide(
+            covariance,
+            denominator,
+            out=np.zeros_like(covariance),
+            where=denominator > 0.0,
+        )
+
     def metadata(self):
         return {
-            "format": "seemc-imaging-raster-v1",
+            "format": "seemc-imaging-raster-v3",
             "sample_name": self.sample_name,
             "length_unit": "angstrom",
             "classifier": self.classifier.definition,
+            "classifier_config": self.classifier.to_dict(),
             "bse_cutoff_ev": self.classifier.bse_cutoff_ev,
+            "lle_max_loss_ev": (
+                self.classifier.lle_max_loss_ev
+                if self.classifier.definition == "causal_lle_v2" else None
+            ),
             "channel_definitions": self.classifier.definitions,
+            "covariance_channels": list(self.covariance_channels),
+            "disjoint_population_channels": list(
+                self.classifier.disjoint_channels
+            ),
             "config": self.config.to_dict(),
+            "geometry": dict(self.geometry_metadata),
             "diagnostics": dict(self.diagnostics),
         }
 
@@ -495,6 +867,9 @@ class RasterResult:
             "launch_sem_xyz_angstrom": self.launch_sem,
             "local_incidence_mean_rad": self.local_incidence_mean_rad,
             "local_incidence_sem_rad": self.local_incidence_sem_rad,
+            "covariance_channels": np.asarray(self.covariance_channels),
+            "primary_count_covariance": self.primary_count_covariance,
+            "yield_covariance": self.yield_covariance,
         }
         for channel in self.classifier.channels:
             payload[f"yield__{channel}"] = self.yield_maps[channel]
@@ -508,10 +883,31 @@ class RasterResult:
         np.savez_compressed(path, **payload)
         return path
 
+    def trajectory_archive(self):
+        if not self.has_recorded_trajectories:
+            raise ValueError(
+                "this raster has no recorded trajectories; use "
+                "RasterConfig(record_trajectories=True)"
+            )
+        return RasterTrajectoryArchive.from_records(
+            self.metadata(),
+            self.x_positions,
+            self.y_positions,
+            self.yield_maps,
+            self.sem_maps,
+            self.trajectory_records,
+        )
+
+    def save_trajectories_npz(self, path):
+        """Save recorded cascades to a compact, pickle-free NPZ archive."""
+        return self.trajectory_archive().save_npz(path)
+
     def rows(self):
         """Return one flat, wide record per pixel for CSV/dataframe use."""
         fractions = self.surface_hit_fractions
         surface_ids = sorted(self.surface_hit_counts)
+        disjoint = self.classifier.disjoint_channels
+        disjoint_covariance = self.covariance(disjoint, of_mean=True)
         rows = []
         nx = len(self.config.x_positions)
         for iy, y in enumerate(self.config.y_positions):
@@ -540,6 +936,13 @@ class RasterResult:
                     row[f"count__{channel}"] = self.count_maps[channel][iy, ix]
                     row[f"yield__{channel}"] = self.yield_maps[channel][iy, ix]
                     row[f"sem__{channel}"] = self.sem_maps[channel][iy, ix]
+                covariance = disjoint_covariance[iy, ix]
+                for first, name_a in enumerate(disjoint):
+                    for second in range(first, len(disjoint)):
+                        name_b = disjoint[second]
+                        row[f"covmean__{name_a}__{name_b}"] = covariance[
+                            first, second
+                        ]
                 for surface_id in surface_ids:
                     row[f"landing_count__{surface_id}"] = int(
                         self.surface_hit_counts[surface_id][iy, ix]
@@ -709,6 +1112,9 @@ class RasterDriver:
         sem_maps = {
             channel: np.zeros(shape, dtype=np.float64) for channel in channels
         }
+        covariance_shape = shape + (len(channels), len(channels))
+        primary_count_covariance = np.zeros(covariance_shape, dtype=np.float64)
+        yield_covariance = np.zeros(covariance_shape, dtype=np.float64)
         completed = np.full(shape, n, dtype=np.int64)
         launch_mean = np.zeros(shape + (3,), dtype=np.float64)
         launch_sem = np.zeros(shape + (3,), dtype=np.float64)
@@ -716,11 +1122,13 @@ class RasterDriver:
         incidence_sem = np.zeros(shape, dtype=np.float64)
         surface_maps = {}
         diagnostics = {}
+        trajectory_records = []
 
         for payload in payloads:
             iy, ix = payload["iy"], payload["ix"]
             sums = payload["channel_sum"]
             sums_sq = payload["channel_sum_sq"]
+            cross_sums = payload["channel_cross_sum"]
             means = sums / n
             if n > 1:
                 variance = np.maximum(
@@ -729,6 +1137,16 @@ class RasterDriver:
                 sem = np.sqrt(variance / n)
             else:
                 sem = np.zeros_like(means)
+                covariance = np.zeros_like(cross_sums)
+            if n > 1:
+                covariance = (
+                    cross_sums - np.outer(sums, sums) / n
+                ) / (n - 1)
+                covariance = 0.5 * (covariance + covariance.T)
+                diagonal = np.maximum(np.diag(covariance), 0.0)
+                covariance[np.diag_indices_from(covariance)] = diagonal
+            primary_count_covariance[iy, ix] = covariance
+            yield_covariance[iy, ix] = covariance / n
             for index, channel in enumerate(channels):
                 count_maps[channel][iy, ix] = int(sums[index])
                 yield_maps[channel][iy, ix] = means[index]
@@ -755,6 +1173,7 @@ class RasterDriver:
                     surface_maps[surface_id] = np.zeros(shape, dtype=np.int64)
                 surface_maps[surface_id][iy, ix] = int(value)
             _add_diagnostics(diagnostics, payload["diagnostics"])
+            trajectory_records.extend(payload["trajectory_records"])
 
         if len(payloads) != self.config.n_pixels:
             warnings.warn(
@@ -770,6 +1189,8 @@ class RasterDriver:
             yield_maps=yield_maps,
             sem_maps=sem_maps,
             count_maps=count_maps,
+            primary_count_covariance=primary_count_covariance,
+            yield_covariance=yield_covariance,
             completed_primaries=completed,
             launch_mean=launch_mean,
             launch_sem=launch_sem,
@@ -777,15 +1198,25 @@ class RasterDriver:
             local_incidence_sem_rad=incidence_sem,
             surface_hit_counts=surface_maps,
             diagnostics=diagnostics,
+            geometry_metadata=_geometry_metadata(self.geometry),
+            trajectory_records=tuple(sorted(
+                trajectory_records,
+                key=lambda item: (item["pixel_id"], item["trajectory_id"]),
+            )),
         )
 
 
 __all__ = [
     "CHANNEL_DEFINITIONS",
+    "DISJOINT_POPULATION_CHANNELS",
+    "LEGACY_CHANNEL_DEFINITIONS",
+    "LEGACY_DISJOINT_POPULATION_CHANNELS",
+    "LEGACY_POPULATION_CHANNELS",
     "POPULATION_CHANNELS",
     "PopulationClassifier",
     "RasterConfig",
     "RasterDriver",
     "RasterResult",
+    "RasterTrajectoryArchive",
     "sample_beam_reference",
 ]

@@ -21,16 +21,31 @@ The package currently contains:
 - a deterministic two-dimensional raster driver with Gaussian beam-spot
   sampling in the plane normal to the beam;
 - per-pixel count, yield, and standard-error maps for energy, ancestry,
-  generation, and operational SE1/SE2/BSE1/BSE2 channels;
+  generation, causal SE1/SE2, and LLE/non-LLE channels;
+- the complete per-pixel cross-channel covariance of per-primary counts and
+  of the mean yield;
+- common-random-number trapezoid parameter sweeps and compressed model
+  libraries;
+- covariance-aware joint profile fitting, position/gain nuisance parameters,
+  and channel-by-channel Fisher-information comparisons;
 - actual landing-position, local-incidence, and per-surface landing-fraction
   maps;
+- opt-in raster trajectory capture with electron identity, ancestry,
+  population/fate, energy, and physical femtosecond flight time;
+- a dark-theme trapezoid scan animator with a moving beam, energy- or
+  population-colored cascade tails, ballistic vacuum continuation, and an
+  accumulating SE/BSE/TEY profile;
 - compressed NPZ, wide CSV, and optional figure export;
 - regression tests against the pre-fork planar snapshot.
 
 Detector response is deliberately not hard-coded yet. The event history is the
 raw evidence from which alternative population definitions can be compared.
-Version 0.4.0 includes a named `branch_v1` SE1/SE2/BSE1/BSE2 post-processor
-alongside the unambiguous energy-cut and ancestry channels.
+Version 0.7.0 separates causal taxonomy from expected spatial resolution and
+experimental filtering. Its default `causal_lle_v2` classifier uses the
+immediate energetic parent's direction for SE1/SE2 and an explicit vacuum
+energy-loss threshold for LLE/non-LLE emitted primaries. Strict first-event BSE
+is an overlapping diagnostic, not a synonym for LLE. The former `branch_v1`
+classifier remains available solely to reproduce 0.6.x results.
 
 ## Installation
 
@@ -40,6 +55,19 @@ python -m pip install -e .
 
 The material database is not bundled. Point `db_path` to a database produced
 with the corrected optlib table conventions.
+
+### 0.7 migration
+
+Do not discard a 0.6.x raster or model library. Version 0.7 reads it, infers
+the legacy basis, and resolves `--channels all_disjoint` to the channels stored
+in that library. To reproduce an old calculation explicitly, pass
+`--population-definition branch_v1` when generating both the raster and model
+library.
+
+New simulations default to `causal_lle_v2`. A new observation and its model
+library must use the same classifier and LLE threshold. The fitter rejects
+old/new classifier mixtures instead of silently comparing identically named
+SE channels with different operational definitions.
 
 ## Record one cascade
 
@@ -181,7 +209,9 @@ result.save_csv("trapezoidal_raster.csv")
 ```
 
 Every population has `count_maps`, `yield_maps`, and `sem_maps`. For example,
-`result.yield_maps["se1"]` is the operational SE1 yield image, while
+`result.yield_maps["se1"]` is the causal incoming-parent SE1 yield image, while
+`result.yield_maps["lle_primary"]` is the energy-filterable low-loss original-
+primary image and
 `result.yield_maps["sey_50ev"]` retains the conventional energy-cut SE image.
 The result also reports actual landing coordinates, local incidence, and the
 fraction of primaries landing on each named surface.
@@ -192,6 +222,7 @@ Run the full command-line example with:
 python examples/trapezoidal_raster.py MaterialDatabase.pkl \
   --material Cu --energy-ev 1000 --nx 101 --ny 21 \
   --primaries-per-pixel 100 --beam-fwhm-nm 2 --parallel \
+  --lle-max-loss-ev 50 \
   --output-prefix trapezoidal_raster
 ```
 
@@ -199,6 +230,106 @@ This writes a self-describing compressed NPZ and a wide per-pixel CSV. Add
 `--plot` after installing `seemc-imaging[plot]` to render six population maps.
 See [raster-driver.md](docs/raster-driver.md) for the exact channel definitions,
 RNG scheme, uncertainty calculation, and output fields.
+
+## Record and animate a one-row scan
+
+Trajectory storage is off by default. A small movie run needs only a few
+primaries at each beam position. This 51-position, three-primary scan transports
+and records just 153 independent primaries:
+
+```bash
+python examples/trapezoidal_raster.py MaterialDatabase.pkl \
+  --material Cu --energy-ev 1000 \
+  --top-width-nm 50 --bottom-width-nm 70 --height-nm 50 \
+  --field-width-nm 100 --nx 51 --ny 1 \
+  --primaries-per-pixel 3 --beam-fwhm-nm 2 \
+  --record-trajectories --trajectory-max-points 500 \
+  --parallel --output-prefix trapezoid_movie
+```
+
+In addition to the ordinary raster NPZ and CSV, this writes
+`trapezoid_movie.trajectories.npz`. The trajectory archive is a compressed,
+pickle-free ragged array. It preserves the beam pixel and actual landing point,
+primary/cascade and parent IDs, generation, operational emitted-population
+label, fate, position, energy, and physical free-flight time for every retained
+path point.
+
+If a scan uses more primaries for a less noisy profile, record only a small
+subset with `--record-primaries-per-pixel N`. `--trajectory-stride N` and
+`--trajectory-max-points N` reduce storage while always preserving the first
+and final path points.
+
+Render an MP4 with:
+
+```bash
+python examples/animate_trapezoidal_scan.py \
+  trapezoid_movie.trajectories.npz \
+  --output trapezoid_movie.mp4 \
+  --fps 30 --frames-per-pixel 16 --pause-frames 4 \
+  --color-by energy --vacuum-flight-nm 35 \
+  --profile-channels populations
+```
+
+Use `--color-by population` for fixed SE1/SE2/fast-cascade/LLE/non-LLE colors,
+or choose a `.gif` output when ffmpeg is unavailable. The lower panel defaults
+to the four population-resolved yields SE1, SE2, LLE, and non-LLE. Select only
+conventional energy-cut signals with `--profile-channels conventional`, restore
+the original three curves with `--profile-channels tey_se_bse`, or provide an
+explicit comma-separated list such as
+`--profile-channels se1,se2,lle_primary,non_lle_primary`. Legacy trajectory
+archives automatically use their former SE1/SE2/BSE1/BSE2 preset.
+The MP4 writer automatically pads odd image dimensions by one pixel for H.264
+compatibility. The renderer preserves
+the relative femtosecond timing within each independently simulated primary
+cascade. Several primaries at one pixel are intentionally overlaid as a visual
+ensemble; they do not share an experimental absolute time origin. The straight
+vacuum continuation after emission is added only for visualization and does
+not alter transport or yield results. Install the optional renderer with
+`python -m pip install -e '.[animation]'`.
+
+## Trapezoid metrology sweep and joint fit
+
+Build a small (3\times3\times3) forward-model library around the nominal
+50/70/50 nm line:
+
+```bash
+python examples/trapezoidal_parameter_sweep.py MaterialDatabase.pkl \
+  --material Cu --energy-ev 1000 \
+  --top-widths-nm 48,50,52 \
+  --bottom-widths-nm 68,70,72 \
+  --heights-nm 45,50,55 \
+  --field-width-nm 100 --nx 201 \
+  --primaries-per-pixel 1000 --beam-fwhm-nm 2 \
+  --lle-max-loss-ev 50 \
+  --parallel --output trapezoid_model_library.npz
+```
+
+Every geometry reuses the same beam-spot and transport seed keys. This common
+random-number design reduces Monte Carlo noise in finite differences without
+changing the marginal distribution of any model.
+
+Fit a raster NPZ and compare the dimensional information in several channel
+sets:
+
+```bash
+python examples/fit_trapezoidal_profile.py \
+  trapezoid_model_library.npz trapezoid_profile_0p5nm_5000.npz \
+  --channels all_disjoint \
+  --shift-range-nm 2 --shift-step-nm 0.1 \
+  --plot --output-prefix trapezoid_fit
+```
+
+The default joint basis is `se1`, `se2`, `fast_cascade_ge50`, `lle_primary`,
+and `non_lle_primary`. These five populations are mutually exclusive and
+partition TEY, so
+their full covariance can be used without treating overlapping channels as
+independent measurements. The fitter searches the discrete geometry library,
+profiles a global yield scale and lateral shift, and can optionally fit one
+constant background per channel. The information report estimates local
+Cramér--Rao bounds for individual and combined channel sets. See
+[signal-taxonomy.md](docs/signal-taxonomy.md) for the definitions and
+[metrology.md](docs/metrology.md) for assumptions and interpretation. Fits now
+reject material, beam, and classifier mismatches unless explicitly overridden.
 
 ## Run a small ensemble
 
@@ -248,7 +379,21 @@ The test suite uses a small synthetic material database. It verifies that:
   but not the assigned collision streams or population counts;
 - a Gaussian spot at an edge mixes top and sidewall landings correctly;
 - every population partition identity holds per trajectory and per pixel;
+- causal SE labels follow the immediate parent's direction without using birth
+  location or presumed resolution as membership criteria;
+- LLE/non-LLE and strict first-event/later-return BSE each partition emitted
+  original primaries, while remaining distinct classifications;
+- legacy `branch_v1` outputs remain reproducible;
 - serial and spawn-parallel raster maps are exactly identical;
+- optional trajectory recording leaves every physical raster result unchanged,
+  retains monotone physical time, and is identical in serial and spawn-parallel
+  runs;
+- trajectory archives round-trip without pickle and the animation renderer
+  produces a valid movie;
+- covariance diagonals equal the squared channel SEMs and serial/parallel
+  covariance matrices are exactly identical;
+- a synthetic unknown profile recovers its known trapezoid, lateral shift,
+  and gain in the joint fitter;
 - ancestry links, collision counts, emission links, and terminal fates are
   internally consistent;
 - the ensemble driver retains histories by energy and trajectory ID.

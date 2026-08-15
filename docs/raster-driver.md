@@ -22,6 +22,19 @@ The output retains three maps for every channel:
 - `yield`: count per incident primary;
 - `sem`: standard error of the yield.
 
+Version 0.5.0 also retains, for every pixel, the full sample covariance of the
+per-primary count vector and the covariance of the mean yield:
+
+\[
+\widehat{\operatorname{Cov}}(\bar{\mathbf Y})
+=\frac{1}{N}\widehat{\operatorname{Cov}}(\mathbf n_p).
+\]
+
+Its diagonal is exactly the square of the reported channel SEM. The NPZ stores
+the full covariance matrices (17-by-17 for the default classifier) as
+`primary_count_covariance` and `yield_covariance`. The CSV includes the upper
+triangle for the five-channel disjoint fitting basis.
+
 ## Beam-spot sampling
 
 `beam_fwhm` is a scalar or pair in Angstrom. It specifies a Gaussian full width
@@ -66,37 +79,64 @@ The following exact identities are checked for every trajectory:
 =\mathrm{cascade}_{all}+\mathrm{primary}_{all}.
 \]
 
-## Operational `branch_v1` labels
+## Default `causal_lle_v2` labels
 
-SE1, SE2, BSE1, and BSE2 are produced by a named post-processing definition so
-they can be revised without changing or rerunning the transport kernel:
+The default post-processor separates causal SE taxonomy, energy filtering, and
+scattering-history diagnostics.
 
-- `se1`: a low-energy emitted cascade electron born before the incident
-  primary first turned toward the launch surface;
-- `se2`: a low-energy emitted cascade electron born after that turn;
-- `bse1`: an emitted incident primary whose first turn toward the surface was
-  caused by its first elastic collision;
-- `bse2`: every other emitted incident primary, including returns formed by
-  multiple elastic scattering.
+- `se1`: a low-energy emitted cascade electron created while its immediate
+  energetic parent was directed into the launch surface;
+- `se2`: a low-energy emitted cascade electron created while its immediate
+  energetic parent was directed toward vacuum through the launch surface;
+- `lle_primary`: an emitted original incident electron with
+  \(E_0-E_{exit}\leq\Delta E_c\);
+- `non_lle_primary`: an emitted original incident electron with
+  \(E_0-E_{exit}>\Delta E_c\).
 
-The surface-return event is used instead of reversal relative to the beam.
-Those conditions differ at oblique incidence, and surface return is the one
-directly connected to escape and image formation.
+Both \(E_0\) and \(E_{exit}\) use the vacuum kinetic-energy reference. The
+default \(\Delta E_c\) is 50 eV and is configurable with
+`PopulationClassifier(lle_max_loss_ev=...)` or `--lle-max-loss-ev`. The value is
+stored in the NPZ metadata and compatibility-checked during fitting.
 
-These labels obey
+No location, spatial resolution, or energy loss is included in SE1/SE2
+membership. Those are properties to calculate after classification. The exact
+direction test uses the immediate parent's direction immediately before the
+creating inelastic collision and the outward normal of the primary's launch
+surface. A zero normal component is assigned to the incoming class so the pair
+is exhaustive.
+
+The five covariance-safe channels are
 
 \[
-\mathrm{SE1}+\mathrm{SE2}=\mathrm{se\_cascade\_lt50},\qquad
-\mathrm{BSE1}+\mathrm{BSE2}=\mathrm{primary\_all}.
+\mathrm{TEY}=\mathrm{SE1}+\mathrm{SE2}
++\mathrm{fast\_cascade}_{\geq50\,eV}
++\mathrm{LLE}_{primary}+\mathrm{nonLLE}_{primary}.
 \]
 
-The raw history and the unambiguous energy/ancestry maps remain the scientific
-reference. `branch_v1` is an explicit hypothesis that can be compared with
-alternative definitions later.
+This is the default basis for joint metrology. LLE is not identified with a
+single- or first-event backscatter.
+
+## Scattering-history diagnostic
+
+Two additional, overlapping channels partition emitted original primaries:
+
+- `first_event_bse`: the first completed collision was elastic and that same
+  event first turned the incident electron toward the launch surface;
+- `later_return_bse`: every other emitted original incident electron.
+
+These channels measure how rare the strict first-event route is. They are not
+part of the default joint basis because they overlap the LLE/non-LLE pair.
+
+## Legacy `branch_v1`
+
+`PopulationClassifier(definition="branch_v1")` exactly reproduces the 0.6.x
+SE1/SE2/BSE1/BSE2 rules and their five-channel covariance basis. New work
+should use `causal_lle_v2`; the legacy definition exists so completed model
+libraries and long simulations remain reproducible.
 
 ## Output formats
 
-`RasterResult.save_npz()` writes a compressed, self-describing archive with
+`RasterResult.save_npz()` writes a compressed, self-describing raster-v3 archive with
 the axes, metadata JSON, all maps, landing statistics, surface fractions, and
 diagnostics. `RasterResult.save_csv()` writes one wide row per pixel for easy
 inspection and dataframe analysis.
@@ -104,3 +144,37 @@ inspection and dataframe analysis.
 The current maps are raw emitted-electron yields. No detector solid angle,
 energy response, electrostatic collection, or detector efficiency is applied
 yet.
+
+## Optional trajectory archive
+
+Set `RasterConfig(record_trajectories=True)` or pass
+`--record-trajectories` to the raster example to retain electron paths.
+Ordinary rasters do not allocate or save track arrays. The optional controls
+are:
+
+- `record_primaries_per_pixel`: record the first deterministic subset of
+  primaries while still using every primary for yield statistics;
+- `trajectory_stride`: retain every Nth path point and both endpoints;
+- `trajectory_max_points`: cap the retained points per transported electron.
+
+`RasterResult.save_trajectories_npz()` writes the
+`seemc-imaging-raster-trajectories-v1` format. Cascades, electrons, and points
+are stored as flat arrays connected by two monotone offset arrays, so the NPZ
+loads with `allow_pickle=False`. Each point contains global `(x,y,z)`, kinetic
+energy, and elapsed femtoseconds. Electron arrays retain ID, parent ID,
+generation, birth time/energy, final direction/energy, fate, and the disjoint
+emitted-population label when applicable. The archive also embeds the raster
+profiles and trapezoid metadata used by the animator.
+
+Recording consumes no random numbers. Free-flight time is calculated from the
+sampled path length and relativistic speed, but never feeds back into collision
+sampling, scattering, barrier transmission, or geometry. Serial and spawn
+parallel trajectory archives are therefore identical for a fixed seed and
+configuration.
+
+The animation lower panel can display any one to six stored yield channels.
+Its `populations` preset shows SE1, SE2, LLE, and non-LLE; `conventional` shows
+only the energy-cut SE and BSE signals; and `tey_se_bse` restores TEY plus
+conventional SE/BSE. Legacy archives automatically fall back to their former
+SE1/SE2/BSE1/BSE2 preset. These curves always use every primary simulated at each
+pixel, even when only a small subset is retained as trajectories.

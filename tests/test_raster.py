@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from seemc_imaging import (
+    DISJOINT_POPULATION_CHANNELS,
     Plane,
     PopulationClassifier,
     RasterConfig,
@@ -43,9 +44,18 @@ def _branch_result(two_elastics_before_return=False):
     )
     records = [
         root,
-        SimpleNamespace(electron_id=1, parent_id=0, birth_event_id=2),
-        SimpleNamespace(electron_id=2, parent_id=0, birth_event_id=5),
-        SimpleNamespace(electron_id=3, parent_id=0, birth_event_id=6),
+        SimpleNamespace(
+            electron_id=1, parent_id=0, birth_event_id=2,
+            parent_direction_before=(0.0, 0.0, 1.0),
+        ),
+        SimpleNamespace(
+            electron_id=2, parent_id=0, birth_event_id=5,
+            parent_direction_before=(0.0, 0.0, -1.0),
+        ),
+        SimpleNamespace(
+            electron_id=3, parent_id=0, birth_event_id=6,
+            parent_direction_before=(0.0, 0.0, -1.0),
+        ),
     ]
     events = [
         SimpleNamespace(event_id=0, electron_id=0, kind="primary_launch"),
@@ -53,9 +63,14 @@ def _branch_result(two_elastics_before_return=False):
     if two_elastics_before_return:
         events.append(SimpleNamespace(event_id=1, electron_id=0, kind="elastic"))
     events.append(SimpleNamespace(event_id=3, electron_id=0, kind="elastic"))
-    history = SimpleNamespace(electrons=records, events=events)
+    history = SimpleNamespace(
+        electrons=records,
+        events=events,
+        incident_energy=500.0,
+        reference_surface_normal=(0.0, 0.0, -1.0),
+    )
     emissions = [
-        _emission(0, 300.0, False, 0),
+        _emission(0, 480.0, False, 0),
         _emission(1, 10.0, True, 1),
         _emission(2, 20.0, True, 2),
         _emission(3, 70.0, True, 1),
@@ -63,7 +78,7 @@ def _branch_result(two_elastics_before_return=False):
     return TrajectoryResult(tey=4, emissions=emissions, history=history)
 
 
-def test_branch_v1_classifier_keeps_unambiguous_splits_alongside_labels():
+def test_causal_lle_classifier_separates_taxonomy_filter_and_diagnostic():
     classifier = PopulationClassifier(50.0)
     counts = classifier.classify(_branch_result())
 
@@ -79,12 +94,24 @@ def test_branch_v1_classifier_keeps_unambiguous_splits_alongside_labels():
     assert counts["generation_2plus"] == 1
     assert counts["se1"] == 1
     assert counts["se2"] == 1
-    assert counts["bse1"] == 1
-    assert counts["bse2"] == 0
+    assert counts["lle_primary"] == 1
+    assert counts["non_lle_primary"] == 0
+    assert counts["first_event_bse"] == 1
+    assert counts["later_return_bse"] == 0
 
     multiple = classifier.classify(_branch_result(two_elastics_before_return=True))
-    assert multiple["bse1"] == 0
-    assert multiple["bse2"] == 1
+    assert multiple["lle_primary"] == 1
+    assert multiple["first_event_bse"] == 0
+    assert multiple["later_return_bse"] == 1
+
+
+def test_legacy_branch_v1_remains_reproducible():
+    classifier = PopulationClassifier(50.0, definition="branch_v1")
+    counts = classifier.classify(_branch_result())
+    assert counts["se1"] == 1
+    assert counts["se2"] == 1
+    assert counts["bse1"] == 1
+    assert counts["bse2"] == 0
 
 
 def test_zero_spot_is_exact_and_consumes_no_random_number():
@@ -126,24 +153,45 @@ def test_plane_raster_maps_partition_counts_and_export(tmp_path):
     )
     assert np.array_equal(
         result.count_maps["primary_all"],
-        result.count_maps["bse1"] + result.count_maps["bse2"],
+        result.count_maps["lle_primary"] + result.count_maps["non_lle_primary"],
+    )
+    assert np.array_equal(
+        result.count_maps["primary_all"],
+        result.count_maps["first_event_bse"]
+        + result.count_maps["later_return_bse"],
     )
     assert np.all(result.surface_hit_counts["sample_plane"] == 4)
     assert np.all(result.launch_sem == 0.0)
     assert np.allclose(result.launch_mean[:, :, 0], ((-10.0, 10.0),) * 2)
     assert np.allclose(result.launch_mean[:, :, 1], ((-5.0, -5.0), (5.0, 5.0)))
+    assert result.yield_covariance.shape == (2, 2, 17, 17)
+    for index, channel in enumerate(result.covariance_channels):
+        assert np.allclose(
+            result.yield_covariance[:, :, index, index],
+            result.sem_maps[channel] ** 2,
+        )
+    disjoint_covariance = result.covariance(DISJOINT_POPULATION_CHANNELS)
+    assert disjoint_covariance.shape == (2, 2, 5, 5)
+    assert np.allclose(
+        disjoint_covariance,
+        np.swapaxes(disjoint_covariance, -1, -2),
+    )
 
     archive = result.save_npz(tmp_path / "raster.npz")
     table = result.save_csv(tmp_path / "raster.csv")
     with np.load(archive, allow_pickle=False) as data:
         metadata = json.loads(str(data["metadata_json"]))
-        assert metadata["format"] == "seemc-imaging-raster-v1"
+        assert metadata["format"] == "seemc-imaging-raster-v3"
+        assert metadata["classifier_config"]["definition"] == "causal_lle_v2"
+        assert metadata["classifier_config"]["lle_max_loss_ev"] == 50.0
         assert data["yield__se1"].shape == (2, 2)
         assert np.array_equal(data["count__tey"], result.count_maps["tey"])
+        assert data["yield_covariance"].shape == (2, 2, 17, 17)
     with table.open(newline="", encoding="utf-8") as stream:
         rows = list(csv.DictReader(stream))
     assert len(rows) == 4
-    assert "yield__bse2" in rows[0]
+    assert "yield__non_lle_primary" in rows[0]
+    assert "covmean__se1__se2" in rows[0]
     assert "landing_fraction__sample_plane" in rows[0]
 
 
@@ -208,5 +256,10 @@ def test_serial_and_spawn_parallel_rasters_are_identical(tmp_path):
         assert np.array_equal(serial.count_maps[channel], parallel.count_maps[channel])
         assert np.array_equal(serial.yield_maps[channel], parallel.yield_maps[channel])
         assert np.array_equal(serial.sem_maps[channel], parallel.sem_maps[channel])
+    assert np.array_equal(
+        serial.primary_count_covariance,
+        parallel.primary_count_covariance,
+    )
+    assert np.array_equal(serial.yield_covariance, parallel.yield_covariance)
     assert np.array_equal(serial.launch_mean, parallel.launch_mean)
     assert serial.diagnostics == parallel.diagnostics
