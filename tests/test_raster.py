@@ -26,12 +26,14 @@ def _sample(tmp_path):
     return Sample("Synthetic", db_path=db_path)
 
 
-def _emission(electron_id, energy, is_cascade, generation):
+def _emission(electron_id, energy, is_cascade, generation,
+              surface_normal=(0.0, 0.0, -1.0)):
     return SimpleNamespace(
         electron_id=electron_id,
         energy=float(energy),
         is_cascade=bool(is_cascade),
         generation=int(generation),
+        surface_normal=surface_normal,
     )
 
 
@@ -103,6 +105,27 @@ def test_causal_lle_classifier_separates_taxonomy_filter_and_diagnostic():
     assert multiple["lle_primary"] == 1
     assert multiple["first_event_bse"] == 0
     assert multiple["later_return_bse"] == 1
+
+
+def test_causal_classifier_retains_both_merged_surface_references():
+    result = _branch_result()
+    result.emissions[1].surface_normal = (0.0, 0.0, 1.0)
+
+    launch = PopulationClassifier(se_reference="launch_surface")
+    escape = PopulationClassifier(se_reference="escape_surface")
+
+    assert launch.emission_labels(result)[1] == "se1"
+    assert escape.emission_labels(result)[1] == "se2"
+    assert launch.to_dict()["se_reference"] == "launch_surface"
+    assert escape.to_dict()["se_reference"] == "escape_surface"
+
+
+def test_lle_threshold_uses_strict_less_than_rule():
+    result = _branch_result()
+    result.emissions[0].energy = 450.0
+    counts = PopulationClassifier(lle_max_loss_ev=50.0).classify(result)
+    assert counts["lle_primary"] == 0
+    assert counts["non_lle_primary"] == 1
 
 
 def test_legacy_branch_v1_remains_reproducible():

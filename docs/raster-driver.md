@@ -85,13 +85,13 @@ The default post-processor separates causal SE taxonomy, energy filtering, and
 scattering-history diagnostics.
 
 - `se1`: a low-energy emitted cascade electron created while its immediate
-  energetic parent was directed into the launch surface;
+  energetic parent was directed into the configured reference surface;
 - `se2`: a low-energy emitted cascade electron created while its immediate
-  energetic parent was directed toward vacuum through the launch surface;
+  energetic parent was directed toward vacuum through that reference surface;
 - `lle_primary`: an emitted original incident electron with
-  \(E_0-E_{exit}\leq\Delta E_c\);
+  \(E_0-E_{exit}<\Delta E_c\);
 - `non_lle_primary`: an emitted original incident electron with
-  \(E_0-E_{exit}>\Delta E_c\).
+  \(E_0-E_{exit}\geq\Delta E_c\).
 
 Both \(E_0\) and \(E_{exit}\) use the vacuum kinetic-energy reference. The
 default \(\Delta E_c\) is 50 eV and is configurable with
@@ -101,9 +101,12 @@ stored in the NPZ metadata and compatibility-checked during fitting.
 No location, spatial resolution, or energy loss is included in SE1/SE2
 membership. Those are properties to calculate after classification. The exact
 direction test uses the immediate parent's direction immediately before the
-creating inelastic collision and the outward normal of the primary's launch
-surface. A zero normal component is assigned to the incoming class so the pair
-is exhaustive.
+creating inelastic collision. By default, the reference normal is the outward
+normal of the primary's launch surface. `se_reference="escape_surface"` (CLI:
+`--se-reference escape_surface`) instead uses the emitted child's actual exit
+surface and reproduces the 0.6.2 classifier. A zero normal component is assigned
+to the incoming class so the pair is exhaustive. The reference choice is stored
+in metadata and compatibility-checked during fitting.
 
 The five covariance-safe channels are
 
@@ -129,10 +132,11 @@ part of the default joint basis because they overlap the LLE/non-LLE pair.
 
 ## Legacy `branch_v1`
 
-`PopulationClassifier(definition="branch_v1")` exactly reproduces the 0.6.x
+`PopulationClassifier(definition="branch_v1")` exactly reproduces the 0.6.1-era
 SE1/SE2/BSE1/BSE2 rules and their five-channel covariance basis. New work
 should use `causal_lle_v2`; the legacy definition exists so completed model
-libraries and long simulations remain reproducible.
+libraries and long simulations remain reproducible. Version 0.6.2 is reproduced
+with `causal_lle_v2` and `se_reference="escape_surface"`.
 
 ## Output formats
 
@@ -175,6 +179,7 @@ configuration.
 The animation lower panel can display any one to six stored yield channels.
 Its `populations` preset shows SE1, SE2, LLE, and non-LLE; `conventional` shows
 only the energy-cut SE and BSE signals; and `tey_se_bse` restores TEY plus
-conventional SE/BSE. Legacy archives automatically fall back to their former
-SE1/SE2/BSE1/BSE2 preset. These curves always use every primary simulated at each
-pixel, even when only a small subset is retained as trajectories.
+conventional SE/BSE. Version 0.6.2 archives automatically use their
+SE1/SE2/LLE-BSE/non-LLE-BSE channels, while branch-v1 archives fall back to
+SE1/SE2/BSE1/BSE2. These curves always use every primary simulated at each pixel,
+even when only a small subset is retained as trajectories.

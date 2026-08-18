@@ -11,6 +11,7 @@ from seemc_imaging import (
     TrapezoidModelLibrary,
     TrapezoidSweepConfig,
     TrapezoidSweepDriver,
+    V062_DISJOINT_POPULATION_CHANNELS,
     compare_channel_information,
 )
 
@@ -224,3 +225,117 @@ def test_fit_rejects_lle_threshold_mismatch():
     )
     issues = ProfileFitter(library).compatibility_issues(observation)
     assert issues == ("LLE maximum loss mismatch: library=20.0, observation=50.0",)
+
+
+def test_fit_rejects_se_reference_mismatch():
+    original = _analytic_library()
+    library = TrapezoidModelLibrary(
+        original.parameters, original.x_positions, original.channels,
+        original.yields, original.covariance_of_mean,
+        original.completed_primaries,
+        {
+            **original.metadata,
+            "classifier_config": {
+                "definition": "causal_lle_v2",
+                "bse_cutoff_ev": 50.0,
+                "lle_max_loss_ev": 50.0,
+                "se_reference": "launch_surface",
+            },
+        },
+    )
+    observation = ProfileObservation(
+        library.x_positions,
+        library.channels,
+        library.yields[0],
+        library.covariance_of_mean[0],
+        {
+            "sample_name": "analytic-test",
+            "classifier_config": {
+                "definition": "causal_lle_v2",
+                "bse_cutoff_ev": 50.0,
+                "lle_max_loss_ev": 50.0,
+                "se_reference": "escape_surface",
+            },
+        },
+    )
+    issues = ProfileFitter(library).compatibility_issues(observation)
+    assert issues == (
+        "SE reference mismatch: library='launch_surface', "
+        "observation='escape_surface'",
+    )
+
+
+def test_fit_accepts_legacy_launch_surface_description():
+    original = _analytic_library()
+    library_metadata = {
+        **original.metadata,
+        "classifier_config": {
+            "definition": "causal_lle_v2",
+            "bse_cutoff_ev": 50.0,
+            "lle_max_loss_ev": 20.0,
+            "se_reference": "launch_surface",
+        },
+    }
+    observation_metadata = {
+        **original.metadata,
+        "classifier_config": {
+            "definition": "causal_lle_v2",
+            "bse_cutoff_ev": 50.0,
+            "lle_max_loss_ev": 20.0,
+            "se_reference": (
+                "immediate_parent_direction_vs_launch_surface_normal"
+            ),
+        },
+    }
+    library = TrapezoidModelLibrary(
+        original.parameters, original.x_positions, original.channels,
+        original.yields, original.covariance_of_mean,
+        original.completed_primaries, library_metadata,
+    )
+    observation = ProfileObservation(
+        library.x_positions,
+        library.channels,
+        library.yields[0],
+        library.covariance_of_mean[0],
+        observation_metadata,
+    )
+    fitter = ProfileFitter(library)
+    assert fitter.compatibility_issues(observation) == ()
+    fitter.fit(observation, fit_scale=False)
+
+
+def test_v062_library_is_recognized_with_escape_surface_metadata():
+    original = _analytic_library()
+    metadata = {
+        **original.metadata,
+        "classifier": "causal_lle_v2",
+        "bse_cutoff_ev": 50.0,
+        "low_loss_max_ev": 50.0,
+        "disjoint_population_channels": list(
+            V062_DISJOINT_POPULATION_CHANNELS
+        ),
+    }
+    library = TrapezoidModelLibrary(
+        original.parameters,
+        original.x_positions,
+        V062_DISJOINT_POPULATION_CHANNELS,
+        original.yields,
+        original.covariance_of_mean,
+        original.completed_primaries,
+        metadata,
+    )
+    observation = ProfileObservation(
+        library.x_positions,
+        library.channels,
+        library.yields[0],
+        library.covariance_of_mean[0],
+        metadata,
+    )
+    fitter = ProfileFitter(library)
+    assert fitter.compatibility_issues(observation) == ()
+    result = fitter.fit(observation, fit_scale=False)
+    assert result.channels == V062_DISJOINT_POPULATION_CHANNELS
+    reports = compare_channel_information(
+        library, reference_parameters=(500.0, 700.0, 500.0)
+    )
+    assert "all_disjoint" in reports

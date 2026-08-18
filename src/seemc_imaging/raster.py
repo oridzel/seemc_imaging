@@ -53,20 +53,21 @@ BASE_CHANNEL_DEFINITIONS = {
 CAUSAL_LLE_CHANNEL_DEFINITIONS = {
     "se1": (
         "causal_lle_v2: low-energy cascade emission created while its "
-        "immediate energetic parent was directed into the launch surface."
+        "immediate energetic parent was directed into the configured "
+        "reference surface."
     ),
     "se2": (
         "causal_lle_v2: low-energy cascade emission created while its "
         "immediate energetic parent was directed toward vacuum through the "
-        "launch surface."
+        "configured reference surface."
     ),
     "lle_primary": (
         "causal_lle_v2: emitted original incident electron with vacuum "
-        "energy loss no greater than the configured LLE threshold."
+        "energy loss below the configured LLE threshold."
     ),
     "non_lle_primary": (
         "causal_lle_v2: emitted original incident electron with vacuum "
-        "energy loss greater than the configured LLE threshold."
+        "energy loss at or above the configured LLE threshold."
     ),
     "first_event_bse": (
         "Diagnostic: emitted original incident electron whose first completed "
@@ -99,7 +100,7 @@ LEGACY_BRANCH_V1_CHANNEL_DEFINITIONS = {
 
 # Public defaults describe the current classifier.  The legacy constants remain
 # available through PopulationClassifier(definition="branch_v1") so archived
-# 0.6.x calculations can be reproduced exactly.
+# 0.6.1-era branch_v1 calculations can be reproduced exactly.
 CHANNEL_DEFINITIONS = {
     **BASE_CHANNEL_DEFINITIONS,
     **CAUSAL_LLE_CHANNEL_DEFINITIONS,
@@ -207,12 +208,13 @@ class PopulationClassifier:
     * strict first-event BSE is retained as an overlapping diagnostic rather
       than identified with LLE or used in the default fitting basis.
 
-    ``branch_v1`` reproduces the 0.6.x operational labels for legacy studies.
+    ``branch_v1`` reproduces the 0.6.1-era operational labels for legacy studies.
     """
 
     bse_cutoff_ev: float = 50.0
     lle_max_loss_ev: float = 50.0
     definition: str = "causal_lle_v2"
+    se_reference: str = "launch_surface"
 
     def __post_init__(self):
         cutoff = float(self.bse_cutoff_ev)
@@ -224,6 +226,10 @@ class PopulationClassifier:
         if self.definition not in {"causal_lle_v2", "branch_v1"}:
             raise ValueError(
                 "definition must be 'causal_lle_v2' or legacy 'branch_v1'"
+            )
+        if self.se_reference not in {"launch_surface", "escape_surface"}:
+            raise ValueError(
+                "se_reference must be 'launch_surface' or 'escape_surface'"
             )
         object.__setattr__(self, "bse_cutoff_ev", cutoff)
         object.__setattr__(self, "lle_max_loss_ev", lle_loss)
@@ -240,8 +246,17 @@ class PopulationClassifier:
             return dict(LEGACY_CHANNEL_DEFINITIONS)
         definitions = dict(CHANNEL_DEFINITIONS)
         threshold = f"{self.lle_max_loss_ev:g} eV"
-        definitions["lle_primary"] += f" Threshold: {threshold}."
-        definitions["non_lle_primary"] += f" Threshold: {threshold}."
+        reference = (
+            "incident primary's launch surface"
+            if self.se_reference == "launch_surface"
+            else "emitted electron's actual escape surface"
+        )
+        definitions["se1"] += f" Reference: {reference}."
+        definitions["se2"] += f" Reference: {reference}."
+        definitions["lle_primary"] += f" Rule: energy loss < {threshold}."
+        definitions["non_lle_primary"] += (
+            f" Rule: energy loss >= {threshold}."
+        )
         return definitions
 
     @property
@@ -259,11 +274,15 @@ class PopulationClassifier:
                 if self.definition == "causal_lle_v2" else None
             ),
             "se_reference": (
-                "immediate_parent_direction_vs_launch_surface_normal"
+                self.se_reference
                 if self.definition == "causal_lle_v2"
                 else "root_primary_first_surface_return_event"
             ),
             "energy_reference": "vacuum",
+            "lle_rule": (
+                "energy_loss_strictly_less_than_threshold"
+                if self.definition == "causal_lle_v2" else None
+            ),
         }
 
     def classify(self, result: TrajectoryResult):
@@ -356,7 +375,9 @@ class PopulationClassifier:
     def _causal_lle_emission_labels(self, result):
         history = result.history
         records = {record.electron_id: record for record in history.electrons}
-        normal = tuple(float(value) for value in history.reference_surface_normal)
+        launch_normal = tuple(
+            float(value) for value in history.reference_surface_normal
+        )
         labels = {}
         for emission in result.emissions:
             if emission.is_cascade and emission.energy < self.bse_cutoff_ev:
@@ -366,6 +387,14 @@ class PopulationClassifier:
                         "causal SE classification requires the immediate parent "
                         "direction at the birth collision"
                     )
+                normal = launch_normal
+                if self.se_reference == "escape_surface":
+                    if emission.surface_normal is None:
+                        raise ValueError(
+                            "escape-surface SE classification requires the "
+                            "emission surface normal"
+                        )
+                    normal = tuple(float(value) for value in emission.surface_normal)
                 parent_outward = _dot(record.parent_direction_before, normal) > 0.0
                 labels[emission.electron_id] = "se2" if parent_outward else "se1"
             elif emission.is_cascade:
@@ -376,7 +405,7 @@ class PopulationClassifier:
                 )
                 labels[emission.electron_id] = (
                     "lle_primary"
-                    if energy_loss <= self.lle_max_loss_ev
+                    if energy_loss < self.lle_max_loss_ev
                     else "non_lle_primary"
                 )
         return labels

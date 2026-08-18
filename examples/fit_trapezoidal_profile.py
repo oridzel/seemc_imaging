@@ -12,6 +12,7 @@ import numpy as np
 from seemc_imaging import (
     DEFAULT_CHANNEL_SETS,
     LEGACY_CHANNEL_SETS,
+    V062_CHANNEL_SETS,
     PARAMETER_NAMES,
     ProfileFitter,
     ProfileObservation,
@@ -22,7 +23,7 @@ from seemc_imaging import (
 
 def _channels(text, available):
     available = set(available)
-    for choices in (DEFAULT_CHANNEL_SETS, LEGACY_CHANNEL_SETS):
+    for choices in (DEFAULT_CHANNEL_SETS, V062_CHANNEL_SETS, LEGACY_CHANNEL_SETS):
         if text in choices and set(choices[text]).issubset(available):
             return choices[text]
     values = tuple(value.strip() for value in text.split(",") if value.strip())
@@ -45,7 +46,8 @@ def main():
     parser.add_argument(
         "--channels", default="all_disjoint",
         help="named set (all_disjoint, low_energy_pair, energy_loss_pair, "
-             "energy_cut_pair, or legacy_branch_v1) or comma-separated channels",
+             "energy_cut_pair, v062_causal_lle, or legacy_branch_v1) "
+             "or comma-separated channels",
     )
     parser.add_argument("--shift-range-nm", type=float, default=2.0)
     parser.add_argument("--shift-step-nm", type=float, default=0.1)

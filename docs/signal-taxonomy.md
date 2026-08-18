@@ -16,9 +16,8 @@ membership criteria.
 
 For an emitted cascade electron below the configured SE/BSE energy cutoff, the
 creating inelastic collision retains the immediate energetic parent's incoming
-direction. Let \(\hat{n}\) be the outward normal of the incident primary's
-launch surface and \(\mathbf{u}_p\) the immediate parent's direction just
-before that collision.
+direction. Let \(\hat{n}\) be the selected outward reference normal and
+\(\mathbf{u}_p\) the immediate parent's direction just before that collision.
 
 \[
 \begin{aligned}
@@ -33,9 +32,13 @@ depth, energy-loss, or resolution requirement. It also works for later cascade
 generations because it follows the immediate energetic parent rather than only
 the root primary's global history.
 
-The launch-surface normal is an explicit operational reference. For complex
-multi-surface structures, alternative local-surface definitions can be added
-as new named classifiers without changing transport.
+The default `launch_surface` reference uses the surface struck by the incident
+primary. It is causal and does not condition membership on the child's later
+fate. The merged `escape_surface` option uses the surface through which the
+emitted SE actually leaves and reproduces the 0.6.2 classifier. Select it with
+`PopulationClassifier(se_reference="escape_surface")` or
+`--se-reference escape_surface`. The selected reference is stored in metadata
+and compatibility-checked during fitting.
 
 ## Low-loss emitted primaries
 
@@ -50,8 +53,8 @@ threshold \(\Delta E_c\),
 
 \[
 \begin{aligned}
-\mathrm{LLE}:&\quad \Delta E\leq\Delta E_c,\\
-\mathrm{nonLLE}:&\quad \Delta E>\Delta E_c.
+\mathrm{LLE}:&\quad \Delta E<\Delta E_c,\\
+\mathrm{nonLLE}:&\quad \Delta E\geq\Delta E_c.
 \end{aligned}
 \]
 
@@ -95,8 +98,9 @@ experimentally measurable channels.
 
 ## Legacy reproduction
 
-`PopulationClassifier(definition="branch_v1")` reproduces the 0.6.x
+`PopulationClassifier(definition="branch_v1")` reproduces the 0.6.1-era
 classification. Its SE classes use the root primary's first surface-return
 time, and its BSE1/BSE2 labels use the former operational elastic-return rule.
 The legacy mode is not the default and should be identified explicitly in any
-continued analysis of old archives.
+continued analysis of those old archives. Version 0.6.2 instead corresponds to
+the current causal/LLE classifier with `se_reference="escape_surface"`.

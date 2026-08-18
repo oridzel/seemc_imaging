@@ -211,6 +211,13 @@ class MCConfig:
     barrier_model: str = "abrupt"
     barrier_width: float = 0.0           # w in ANGSTROM, used by 'expqm' only
 
+    # Apply the reciprocal vacuum->solid surface-barrier scattering to the
+    # incident primary. Historically SEEMC refracted every primary into the
+    # solid with probability 1, while the solid->vacuum barrier in Electron.escape()
+    # already included quantum reflection. At grazing incidence this omission
+    # removes the narrow specular BSE population seen in JMONSEL.
+    incoming_barrier_reflection: bool = True
+
     # --- how the SE-generation mechanism is decided ---
     # 'mao'  : Mao et al. 2008 Eq. (9).  After (omega, q) are sampled, single
     #          electron excitation is declared if q- <= q <= q+, and plasmon
@@ -450,6 +457,72 @@ def barrier_transmission(E_perp, Ui, cfg):
     return max(0.0, min(1.0, 1.0 - r * r))
 
 
+def incoming_barrier_transmission(E_perp_vac, Ui, cfg):
+    """Transmission probability for a primary crossing vacuum -> solid.
+
+    This is the reciprocal partner of :func:`barrier_transmission`.  The
+    electron falls down the inner-potential step, so there is no classical
+    threshold: the normal kinetic energy changes from ``E_perp_vac`` outside
+    to ``E_perp_vac + Ui`` inside.
+
+    For an abrupt step
+
+        T = 4 k_v k_s / (k_v + k_s)^2,
+        R = 1 - T,
+
+    with ``k_v ~ sqrt(E_perp_vac)`` and
+    ``k_s ~ sqrt(E_perp_vac + Ui)``.  The same exponential-barrier expression
+    used for outgoing electrons is symmetric under interchange of k1/k2, so
+    it also provides the reciprocal ``expqm`` result.  The classical model
+    transmits every incoming primary.
+    """
+    E_perp_vac = float(E_perp_vac)
+    Ui = float(Ui)
+    if not math.isfinite(E_perp_vac) or E_perp_vac < 0.0:
+        raise ValueError("E_perp_vac must be finite and non-negative")
+    if not math.isfinite(Ui) or Ui < 0.0:
+        raise ValueError("Ui must be finite and non-negative")
+
+    model = cfg.barrier_model
+    if model == "classical" or Ui == 0.0:
+        return 1.0
+
+    # Angstrom^-1, consistent with barrier_transmission().
+    k_v = math.sqrt(2.0 * E_perp_vac / H2EV) / A0_ANG
+    k_s = math.sqrt(2.0 * (E_perp_vac + Ui) / H2EV) / A0_ANG
+
+    if model == "abrupt":
+        denom = (k_v + k_s) ** 2
+        if denom <= 0.0:
+            return 0.0
+        return max(0.0, min(1.0, 4.0 * k_v * k_s / denom))
+
+    # JMONSEL/Villarrubia exponential barrier.  Only the absolute difference
+    # enters after squaring, so the same formula is valid for the downward step.
+    w = cfg.barrier_width
+    r = _sinh_ratio(
+        0.5 * math.pi * w * abs(k_s - k_v),
+        0.5 * math.pi * w * (k_s + k_v),
+    )
+    return max(0.0, min(1.0, 1.0 - r * r))
+
+
+def specular_reflect_direction(direction, surface_normal):
+    """Reflect a unit propagation direction specularly about a surface."""
+    d = _vec3(direction)
+    n = _vec3(surface_normal)
+    dn = math.sqrt(_dot3(d, d))
+    nn = math.sqrt(_dot3(n, n))
+    if dn <= 0.0 or nn <= 0.0 or not (math.isfinite(dn) and math.isfinite(nn)):
+        raise ValueError("direction and surface_normal must be finite non-zero vectors")
+    d = tuple(v / dn for v in d)
+    n = tuple(v / nn for v in n)
+    c = _dot3(d, n)
+    out = [d[i] - 2.0 * c * n[i] for i in range(3)]
+    norm = math.sqrt(_dot3(out, out))
+    return [v / norm for v in out]
+
+
 def browning_cross_section(E_ev, Z):
     """
     Browning's empirical total elastic cross section (Browning, Li, Chui, Ye,
@@ -521,6 +594,9 @@ class Diagnostics(dict):
         "surface_encounters",
         "escapes",
         "internal_reflections",
+        "incoming_barrier_encounters",
+        "incoming_barrier_reflections",
+        "incoming_barrier_transmissions",
         "se_created",
         "se_blocked_pauli",       # FEG kinematics forbade a target state
         "se_pauli_fallback",      # ... and a DOS-based secondary was made instead
@@ -1276,6 +1352,8 @@ class Emission:
     region_from: Optional[str] = None
     region_to: Optional[str] = None
     primitive_id: Optional[int] = None
+    emission_mechanism: str = "transport_escape"
+    barrier_reflection_probability: Optional[float] = None
 
 
 class _HistoryRecorder:
@@ -1967,6 +2045,111 @@ class TrajectoryResult:
     history: Optional[TrajectoryHistory] = None
 
 
+def vacuum_incident_direction(angle_rad, surface_normal=(0.0, 0.0, -1.0),
+                              azimuth_rad=0.0):
+    """Unit primary direction in vacuum, pointing into the local surface.
+
+    This uses the same tangent convention as :func:`incident_direction` but
+    deliberately performs no inner-potential refraction.  For the default
+    plane (solid z>0, vacuum z<0) and zero azimuth it returns
+    ``[sin(angle), 0, cos(angle)]``.
+    """
+    normal = _vec3(surface_normal)
+    normal_length = math.sqrt(_dot3(normal, normal))
+    if normal_length == 0.0 or not math.isfinite(normal_length):
+        raise ValueError("surface_normal must be a finite non-zero vector")
+    normal = tuple(value / normal_length for value in normal)
+    inward = tuple(-value for value in normal)
+
+    reference = (1.0, 0.0, 0.0)
+    projection = _dot3(reference, inward)
+    tangent_x = tuple(reference[i] - projection * inward[i] for i in range(3))
+    tangent_length = math.sqrt(_dot3(tangent_x, tangent_x))
+    if tangent_length < 1e-14:
+        reference = (0.0, 1.0, 0.0)
+        projection = _dot3(reference, inward)
+        tangent_x = tuple(reference[i] - projection * inward[i] for i in range(3))
+        tangent_length = math.sqrt(_dot3(tangent_x, tangent_x))
+    tangent_x = tuple(value / tangent_length for value in tangent_x)
+    tangent_y = (
+        inward[1] * tangent_x[2] - inward[2] * tangent_x[1],
+        inward[2] * tangent_x[0] - inward[0] * tangent_x[2],
+        inward[0] * tangent_x[1] - inward[1] * tangent_x[0],
+    )
+
+    ca = math.cos(float(azimuth_rad))
+    sa = math.sin(float(azimuth_rad))
+    tangent = tuple(ca * tangent_x[i] + sa * tangent_y[i] for i in range(3))
+    direction = [
+        math.sin(float(angle_rad)) * tangent[i]
+        + math.cos(float(angle_rad)) * inward[i]
+        for i in range(3)
+    ]
+    norm = math.sqrt(_dot3(direction, direction))
+    return [value / norm for value in direction]
+
+
+def sample_incoming_barrier(E0, sample: Sample, vacuum_direction,
+                            surface_normal, rng):
+    """Sample reflection/transmission of one incident primary at the barrier.
+
+    Returns a dictionary containing the reflection probability and either a
+    specular vacuum direction or the refracted solid state.  No RNG draw is
+    consumed when ``incoming_barrier_reflection`` is disabled, preserving the
+    historical seeded stream exactly in that comparison mode.
+    """
+    E0 = float(E0)
+    if not math.isfinite(E0) or E0 < 0.0:
+        raise ValueError("E0 must be finite and non-negative")
+
+    vacuum = _vec3(vacuum_direction)
+    vn = math.sqrt(_dot3(vacuum, vacuum))
+    normal = _vec3(surface_normal)
+    nn = math.sqrt(_dot3(normal, normal))
+    if vn <= 0.0 or nn <= 0.0:
+        raise ValueError("vacuum_direction and surface_normal must be non-zero")
+    vacuum = tuple(v / vn for v in vacuum)
+    normal = tuple(v / nn for v in normal)
+
+    mu_in = -_dot3(vacuum, normal)
+    if mu_in <= 1e-15:
+        raise ValueError("vacuum_direction does not point into the local surface")
+    mu_in = max(0.0, min(1.0, mu_in))
+    E_perp_vac = E0 * mu_in * mu_in
+
+    if not sample.cfg.incoming_barrier_reflection:
+        T = 1.0
+        reflected = False
+    else:
+        T = incoming_barrier_transmission(E_perp_vac, sample.Ui, sample.cfg)
+        reflected = bool(T < 1.0 and rng.random() >= T)
+
+    R = 1.0 - T
+    if reflected:
+        return {
+            "reflected": True,
+            "T": float(T),
+            "R": float(R),
+            "E_perp_vac": float(E_perp_vac),
+            "vacuum_direction_in": vacuum,
+            "vacuum_direction_out": tuple(specular_reflect_direction(vacuum, normal)),
+            "E_s": None,
+            "solid_direction": None,
+        }
+
+    E_s, solid_direction = refract_incident_direction(E0, sample, vacuum, normal)
+    return {
+        "reflected": False,
+        "T": float(T),
+        "R": float(R),
+        "E_perp_vac": float(E_perp_vac),
+        "vacuum_direction_in": vacuum,
+        "vacuum_direction_out": None,
+        "E_s": float(E_s),
+        "solid_direction": tuple(solid_direction),
+    }
+
+
 def incident_direction(E0, sample: Sample, angle_rad,
                        surface_normal=(0.0, 0.0, -1.0), azimuth_rad=0.0):
     """
@@ -2108,31 +2291,136 @@ def simulate_trajectory(sample: Sample, E0, angle_rad, rng, track=False,
     if initial_region != solid_region:
         raise ValueError("launch_position must lie on or inside the solid")
 
-    history_angle = float(angle_rad)
+    # Construct the physical VACUUM incident direction first.  The historical
+    # code immediately refracted this state into the solid, which implicitly
+    # set the incoming barrier transmission probability to one.
     if vacuum_direction is None:
-        E_s, uvw0 = incident_direction(
-            float(E0), sample, angle_rad,
-            surface_normal=surface_normal, azimuth_rad=azimuth_rad,
-        )
+        vacuum = tuple(vacuum_incident_direction(
+            float(angle_rad), surface_normal=surface_normal,
+            azimuth_rad=azimuth_rad,
+        ))
     else:
-        E_s, uvw0 = refract_incident_direction(
-            float(E0), sample, vacuum_direction, surface_normal
-        )
         vacuum = _vec3(vacuum_direction)
         vacuum_norm = math.sqrt(_dot3(vacuum, vacuum))
         vacuum = tuple(value / vacuum_norm for value in vacuum)
-        outward = _vec3(surface_normal)
-        outward_norm = math.sqrt(_dot3(outward, outward))
-        outward = tuple(value / outward_norm for value in outward)
-        local_cosine = max(-1.0, min(1.0, -_dot3(vacuum, outward)))
-        history_angle = math.acos(local_cosine)
+
+    outward = _vec3(surface_normal)
+    outward_norm = math.sqrt(_dot3(outward, outward))
+    outward = tuple(value / outward_norm for value in outward)
+    local_cosine = max(-1.0, min(1.0, -_dot3(vacuum, outward)))
+    history_angle = math.acos(local_cosine)
+
+    entry = sample_incoming_barrier(
+        float(E0), sample, vacuum, outward, rng
+    )
+    diag["incoming_barrier_encounters"] += 1
+
+    # A barrier-reflected primary never enters the solid, so it is an emitted
+    # primary/BSE immediately.  This is the narrow specular population that
+    # appears at theta = 2*incidence_angle for a planar tilted sample.
+    if entry["reflected"]:
+        diag["incoming_barrier_reflections"] += 1
+        diag["escapes"] += 1
+        res.tey = 1
+        res.bse_cascade = 1
+        if float(E0) < cfg.bse_cutoff_ev:
+            res.sey_50ev = 1
+        else:
+            res.bse_50ev = 1
+
+        primary_id = int(trajectory_id) if trajectory_id is not None else -1
+        uvw_ref = _vec3(entry["vacuum_direction_out"])
+        if cfg.collect_spectra:
+            res.emissions.append(
+                Emission(
+                    energy=float(E0),
+                    uz=_dot3(uvw_ref, outward),
+                    is_cascade=False,
+                    generation=0,
+                    birth_depth=0.0,
+                    electron_id=primary_id,
+                    parent_id=None,
+                    root_primary_id=primary_id,
+                    xyz=_vec3(launch_position),
+                    uvw=uvw_ref,
+                    surface_id=getattr(geometry, "surface_id", "sample"),
+                    surface_normal=outward,
+                    region_from=getattr(geometry, "vacuum_region", VACUUM_REGION),
+                    region_to=getattr(geometry, "vacuum_region", VACUUM_REGION),
+                    primitive_id=0,
+                    emission_mechanism="incoming_barrier_reflection",
+                    barrier_reflection_probability=float(entry["R"]),
+                )
+            )
+
+        if track:
+            # A reflected-at-entry trajectory has no solid free flight. Store
+            # the surface point once so plotting code can still represent it.
+            res.tracks.append([[
+                round(float(launch_position[0]), 3),
+                round(float(launch_position[1]), 3),
+                round(float(launch_position[2]), 3),
+                round(float(E0), 3),
+            ]])
+            res.track_times_fs.append([0.0])
+            res.track_electron_ids.append(primary_id)
+
+        if history:
+            recorder = _HistoryRecorder(
+                vacuum, E0, history_angle, launch_position=launch_position,
+                trajectory_id=trajectory_id, geometry=geometry,
+                reference_surface_normal=surface_normal,
+            )
+            rid = recorder.register_primary(float(E0), launch_position, vacuum)
+            record = recorder._record_for(rid)
+            record.surface_encounters += 1
+            record.fate = "emitted"
+            record.final_position = _vec3(launch_position)
+            record.final_energy = float(E0)
+            record.final_direction = uvw_ref
+            record.final_time_fs = 0.0
+            recorder._event(
+                electron_id=rid,
+                kind="incoming_barrier_reflection",
+                position=_vec3(launch_position),
+                energy_before=float(E0),
+                energy_after=float(E0),
+                direction_before=_vec3(vacuum),
+                direction_after=uvw_ref,
+                time_fs=0.0,
+                outcome="reflected_to_vacuum",
+                surface_id=getattr(geometry, "surface_id", "sample"),
+                surface_normal=outward,
+                region_from=getattr(geometry, "vacuum_region", VACUUM_REGION),
+                region_to=getattr(geometry, "vacuum_region", VACUUM_REGION),
+                primitive_id=0,
+                metadata={
+                    "reflection_probability": float(entry["R"]),
+                    "E_perp_vac_eV": float(entry["E_perp_vac"]),
+                },
+            )
+            res.history = recorder.history
+        return res
+
+    diag["incoming_barrier_transmissions"] += 1
+    E_s = float(entry["E_s"])
+    uvw0 = list(entry["solid_direction"])
+
     recorder = _HistoryRecorder(
         uvw0, E0, history_angle, launch_position=launch_position,
         trajectory_id=trajectory_id, geometry=geometry,
         reference_surface_normal=surface_normal,
     ) if history else None
-    primary_id = recorder.register_primary(E_s, launch_position, uvw0) \
-        if recorder is not None else -1
+    # Keep a lightweight primary association even when full collision history
+    # is disabled.  High-statistics spectrum workflows need per-primary
+    # emission counts for uncertainty estimates, but should not have to retain
+    # every collision record merely to identify the originating trajectory.
+    if recorder is not None:
+        primary_id = recorder.register_primary(E_s, launch_position, uvw0)
+    elif trajectory_id is not None:
+        primary_id = int(trajectory_id)
+    else:
+        primary_id = -1
     queue = [Electron(sample, E_s, launch_position, uvw0,
                       generation=0, is_cascade=False, rng=rng,
                       save_coordinates=track, electron_id=primary_id,
@@ -2358,6 +2646,8 @@ class SEEMC:
         self.n_completed = np.zeros(n, dtype=int)
         self.sey_err = np.zeros(n)
         self.bse_err = np.zeros(n)
+        self.sey_50ev_err = np.zeros(n)
+        self.bse_50ev_err = np.zeros(n)
 
         self.emissions = [[] for _ in range(n)]
         self.histories = [[] for _ in range(n)]
@@ -2369,7 +2659,8 @@ class SEEMC:
         return [self.seed, int(k), int(traj)]
 
     # ------------------------------------------------------------------
-    def run_simulation(self, use_parallel=False, progress=True, verbose=True):
+    def run_simulation(self, use_parallel=False, progress=True, verbose=True,
+                       workers=None):
         """
         Run all energies.  NOTE: `use_parallel=True` uses the 'spawn' start
         method, so the calling code must be guarded:
@@ -2392,10 +2683,16 @@ class SEEMC:
 
         n_traj = self.n_trajectories
 
+        if workers is not None:
+            workers = int(workers)
+            if workers < 1:
+                raise ValueError("workers must be at least 1")
+            use_parallel = use_parallel or workers > 1
+
         if use_parallel:
             import multiprocessing as mp
             ctx = mp.get_context("spawn")
-            nproc = mp.cpu_count()
+            nproc = mp.cpu_count() if workers is None else workers
             chunksize = max(1, n_traj // (nproc * 8))
             pool = ctx.Pool(
                 processes=nproc,
@@ -2461,6 +2758,7 @@ class SEEMC:
                 self.tey[k], self.sey[k], self.bse[k] = mean[0], mean[1], mean[2]
                 self.sey_50ev[k], self.bse_50ev[k] = mean[3], mean[4]
                 self.tey_err[k], self.sey_err[k], self.bse_err[k] = sem[0], sem[1], sem[2]
+                self.sey_50ev_err[k], self.bse_50ev_err[k] = sem[3], sem[4]
 
                 if self.track_trajectories:
                     self.tracks.append(tracks_E)

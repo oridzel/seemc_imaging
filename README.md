@@ -40,12 +40,15 @@ The package currently contains:
 
 Detector response is deliberately not hard-coded yet. The event history is the
 raw evidence from which alternative population definitions can be compared.
-Version 0.7.0 separates causal taxonomy from expected spatial resolution and
+Version 0.7.3 separates causal taxonomy from expected spatial resolution and
 experimental filtering. Its default `causal_lle_v2` classifier uses the
 immediate energetic parent's direction for SE1/SE2 and an explicit vacuum
-energy-loss threshold for LLE/non-LLE emitted primaries. Strict first-event BSE
+energy-loss threshold for LLE/non-LLE emitted primaries. It merges the 0.6.2
+escape-surface SE reference as an optional, metadata-tracked classifier while
+retaining the 0.7.0 launch-surface default. Strict first-event BSE
 is an overlapping diagnostic, not a synonym for LLE. The former `branch_v1`
-classifier remains available solely to reproduce 0.6.x results.
+classifier remains available solely to reproduce 0.6.1-era results. Version
+0.6.2 is reproduced with `--se-reference escape_surface`.
 
 ## Installation
 
@@ -56,16 +59,27 @@ python -m pip install -e .
 The material database is not bundled. Point `db_path` to a database produced
 with the corrected optlib table conventions.
 
-### 0.7 migration
+### Earlier-version migration
 
-Do not discard a 0.6.x raster or model library. Version 0.7 reads it, infers
-the legacy basis, and resolves `--channels all_disjoint` to the channels stored
-in that library. To reproduce an old calculation explicitly, pass
-`--population-definition branch_v1` when generating both the raster and model
-library.
+Do not discard an earlier raster or model library. Version 0.7.3 recognizes
+both historical branches:
+
+- 0.6.1-era `branch_v1` archives retain SE1/SE2/BSE1/BSE2. Reproduce them with
+  `--population-definition branch_v1`.
+- 0.6.2 archives retain `lle_bse`/`non_lle_bse` and the escape-surface SE
+  reference. Reproduce that classifier with `--se-reference escape_surface`.
+
+The fitter resolves `--channels all_disjoint` to the basis actually stored in
+the library. The animation `populations` preset also adapts to current, 0.6.2,
+or branch-v1 trajectory archives.
+
+The fitter also canonicalizes the 0.7.0 metadata description
+`immediate_parent_direction_vs_launch_surface_normal` to `launch_surface`.
+Those terms encode the same SE1/SE2 reference and can therefore be compared
+without `--allow-incompatible`.
 
 New simulations default to `causal_lle_v2`. A new observation and its model
-library must use the same classifier and LLE threshold. The fitter rejects
+library must use the same classifier, SE reference, and LLE threshold. The fitter rejects
 old/new classifier mixtures instead of silently comparing identically named
 SE channels with different operational definitions.
 
@@ -223,6 +237,7 @@ python examples/trapezoidal_raster.py MaterialDatabase.pkl \
   --material Cu --energy-ev 1000 --nx 101 --ny 21 \
   --primaries-per-pixel 100 --beam-fwhm-nm 2 --parallel \
   --lle-max-loss-ev 50 \
+  --se-reference launch_surface \
   --output-prefix trapezoidal_raster
 ```
 
@@ -301,6 +316,7 @@ python examples/trapezoidal_parameter_sweep.py MaterialDatabase.pkl \
   --field-width-nm 100 --nx 201 \
   --primaries-per-pixel 1000 --beam-fwhm-nm 2 \
   --lle-max-loss-ev 50 \
+  --se-reference launch_surface \
   --parallel --output trapezoid_model_library.npz
 ```
 
@@ -352,6 +368,26 @@ first_history = model.histories[0][0]
 History can be much larger than yield results. Use it for development and
 population studies; leave `history=False` for high-statistics production runs
 that need only yields or spectra.
+
+## Build incidence-angle plane samplers
+
+Version 0.7.4 includes a resumable workflow that exports the six planar SE/BSE
+tables used by the correction-factor model. Its default energy nodes match the
+existing JMONSEL sampler library, while its angle grid becomes denser near
+grazing incidence:
+
+```bash
+python examples/generate_plane_sampler_grid.py MaterialDatabase.pkl \
+  --material Cu --angles-deg 75 --primaries 20000 \
+  --quantiles 513 --workers 12 --seed 20260816 --resume \
+  --output sampler_library/Cu_SEEMC
+```
+
+The emitted-energy split is SE below 50 eV and BSE at or above 50 eV. Polar
+angle is measured from the beam-back direction; downstream azimuth sampling
+must still enforce the outward sample half-space. See
+[plane-sampler-library.md](docs/plane-sampler-library.md) for the grids,
+coordinate equation, full-run command, checkpoints, and validation workflow.
 
 ## Testing
 

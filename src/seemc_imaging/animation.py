@@ -19,6 +19,8 @@ POPULATION_COLORS = {
     "fast_cascade_ge50": "#f9844a",
     "lle_primary": "#43aaef",
     "non_lle_primary": "#c77dff",
+    "lle_bse": "#43aaef",
+    "non_lle_bse": "#c77dff",
     "bse1": "#43aaef",
     "bse2": "#c77dff",
     "cascade_absorbed": "#98a2b3",
@@ -32,14 +34,17 @@ PROFILE_STYLES = {
     "se1": ("SE1", "#39d98a"),
     "se2": ("SE2", "#f9c74f"),
     "fast_cascade_ge50": ("Fast cascade", "#f9844a"),
-    "lle_primary": ("LLE primary", "#43aaef"),
-    "non_lle_primary": ("Non-LLE primary", "#c77dff"),
+    "lle_primary": ("Low-loss BSE", "#43aaef"),
+    "non_lle_primary": ("Non-LLE BSE", "#c77dff"),
+    "lle_bse": ("Low-loss BSE", "#43aaef"),
+    "non_lle_bse": ("Non-LLE BSE", "#c77dff"),
     "bse1": ("BSE1", "#43aaef"),
     "bse2": ("BSE2", "#c77dff"),
 }
 
 PROFILE_PRESETS = {
     "populations": ("se1", "se2", "lle_primary", "non_lle_primary"),
+    "v062_populations": ("se1", "se2", "lle_bse", "non_lle_bse"),
     "legacy_populations": ("se1", "se2", "bse1", "bse2"),
     "conventional": ("sey_50ev", "bse_50ev"),
     "tey_se_bse": ("tey", "sey_50ev", "bse_50ev"),
@@ -94,6 +99,21 @@ def _geometry_values(archive):
     return {name: float(geometry[name]) / 10.0 for name in required}
 
 
+def _trapezoid_surface_height_nm(
+        x_nm, *, top_width, bottom_width, height, center_x,
+        substrate_height):
+    """Return the nominal normal-incidence beam intersection height."""
+    distance = abs(float(x_nm) - float(center_x))
+    half_top = 0.5 * float(top_width)
+    half_bottom = 0.5 * float(bottom_width)
+    if distance <= half_top:
+        return float(substrate_height) + float(height)
+    if distance >= half_bottom or half_bottom <= half_top:
+        return float(substrate_height)
+    side_fraction = (half_bottom - distance) / (half_bottom - half_top)
+    return float(substrate_height) + float(height) * side_fraction
+
+
 def animate_trapezoidal_scan(
         archive, output, *, fps=30, frames_per_pixel=16, pause_frames=4,
         pixel_stride=1, color_by="energy", tail_fraction=0.45,
@@ -128,6 +148,12 @@ def animate_trapezoidal_scan(
             requested_preset = profile_channels
             profile_channels = PROFILE_PRESETS[requested_preset]
             available = {str(value) for value in archive.profile_channels}
+            if (requested_preset == "populations"
+                    and not set(profile_channels).issubset(available)
+                    and set(PROFILE_PRESETS["v062_populations"]).issubset(
+                        available
+                    )):
+                profile_channels = PROFILE_PRESETS["v062_populations"]
             if (requested_preset == "populations"
                     and not set(profile_channels).issubset(available)
                     and set(PROFILE_PRESETS["legacy_populations"]).issubset(
@@ -345,13 +371,27 @@ def animate_trapezoidal_scan(
         cascade_indices = cascades_by_pixel[pixel_id]
         ix = int(archive.cascade_ix[cascade_indices[0]])
         nominal_x = float(x_nm[ix])
-        launch = np.mean(archive.cascade_launch_xyz_angstrom[cascade_indices], axis=0)
-        launch_x = float(launch[0] / 10.0)
-        launch_height = float(-launch[2] / 10.0)
+        nominal_height = _trapezoid_surface_height_nm(
+            nominal_x,
+            top_width=top_width,
+            bottom_width=bottom_width,
+            height=height,
+            center_x=center_x,
+            substrate_height=substrate_height,
+        )
         beam_top = axis.get_ylim()[1]
-        beam_line.set_data([nominal_x, launch_x], [beam_top, launch_height])
-        beam_halo.set_data([nominal_x, launch_x], [beam_top, launch_height])
-        beam_spot.set_offsets(np.asarray([[launch_x, launch_height]]))
+        # The cyan glyph represents the commanded beam axis.  Recorded launch
+        # points include Gaussian beam-spot sampling and must not drive it:
+        # their small random mean offset can make a monotone raster look as if
+        # it steps backward or changes incidence angle.  The actual cascade
+        # tracks below retain their sampled launch coordinates.
+        beam_line.set_data(
+            [nominal_x, nominal_x], [beam_top, nominal_height]
+        )
+        beam_halo.set_data(
+            [nominal_x, nominal_x], [beam_top, nominal_height]
+        )
+        beam_spot.set_offsets(np.asarray([[nominal_x, nominal_height]]))
 
         for cascade_index in cascade_indices:
             for electron_index in archive.cascade_electron_indices(cascade_index):

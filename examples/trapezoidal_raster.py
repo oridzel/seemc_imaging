@@ -31,14 +31,24 @@ def main():
     parser.add_argument("--material", default="Cu")
     parser.add_argument("--energy-ev", type=float, default=1000.0)
     parser.add_argument(
-        "--lle-max-loss-ev", type=float, default=50.0,
+        "--lle-max-loss-ev", "--low-loss-max-ev",
+        dest="lle_max_loss_ev", type=float, default=50.0,
         help="maximum vacuum energy loss for the LLE primary channel",
     )
     parser.add_argument(
         "--population-definition",
         choices=("causal_lle_v2", "branch_v1"),
         default="causal_lle_v2",
-        help="use branch_v1 only to reproduce legacy 0.6.x outputs",
+        help="use branch_v1 only to reproduce legacy 0.6.1-era outputs",
+    )
+    parser.add_argument(
+        "--se-reference",
+        choices=("launch_surface", "escape_surface"),
+        default="launch_surface",
+        help=(
+            "surface normal used for causal SE1/SE2; escape_surface "
+            "reproduces the 0.6.2 classifier"
+        ),
     )
     parser.add_argument("--top-width-nm", type=float, default=50.0)
     parser.add_argument("--bottom-width-nm", type=float, default=70.0)
@@ -156,6 +166,7 @@ def main():
         bse_cutoff_ev=sample.cfg.bse_cutoff_ev,
         lle_max_loss_ev=args.lle_max_loss_ev,
         definition=args.population_definition,
+        se_reference=args.se_reference,
     )
     result = RasterDriver(sample, line, config, classifier).run(
         use_parallel=args.parallel,

@@ -14,6 +14,7 @@ from seemc_imaging import (
 )
 
 from synthetic_material import write_synthetic_database
+from seemc_imaging.animation import _trapezoid_surface_height_nm
 
 
 def _sample(tmp_path):
@@ -42,6 +43,22 @@ def _recording_config():
         trajectory_stride=2,
         trajectory_max_points=40,
     )
+
+
+def test_nominal_beam_axis_follows_trapezoid_surface_without_launch_jitter():
+    values = [
+        _trapezoid_surface_height_nm(
+            x,
+            top_width=10.0,
+            bottom_width=20.0,
+            height=10.0,
+            center_x=0.0,
+            substrate_height=0.0,
+        )
+        for x in (-12.0, -10.0, -7.5, -5.0, 0.0, 5.0, 7.5, 10.0, 12.0)
+    ]
+    assert values == pytest.approx((0.0, 0.0, 5.0, 10.0, 10.0,
+                                    10.0, 5.0, 0.0, 0.0))
 
 
 def test_transport_tracks_link_electron_ids_and_monotone_physical_time(tmp_path):
@@ -168,6 +185,24 @@ def test_profile_channel_presets_and_validation(tmp_path):
         profile_channels="conventional",
     )
     assert conventional.stat().st_size > 1_000
+    renamed = np.asarray([
+        "lle_bse" if str(name) == "lle_primary"
+        else "non_lle_bse" if str(name) == "non_lle_primary"
+        else str(name)
+        for name in archive.profile_channels
+    ])
+    archive.profile_channels = renamed
+    v062 = animate_trapezoidal_scan(
+        archive,
+        tmp_path / "v062.gif",
+        fps=4,
+        frames_per_pixel=2,
+        pause_frames=0,
+        vacuum_flight_nm=5.0,
+        dpi=45,
+        profile_channels="populations",
+    )
+    assert v062.stat().st_size > 1_000
     with pytest.raises(ValueError, match="unknown profile channels"):
         animate_trapezoidal_scan(
             archive,

@@ -43,6 +43,27 @@ DEFAULT_CHANNEL_SETS = {
     "all_disjoint": DISJOINT_POPULATION_CHANNELS,
 }
 
+V062_DISJOINT_POPULATION_CHANNELS = (
+    "se1",
+    "se2",
+    "fast_cascade_ge50",
+    "lle_bse",
+    "non_lle_bse",
+)
+
+V062_CHANNEL_SETS = {
+    "se1": ("se1",),
+    "se2": ("se2",),
+    "lle_bse": ("lle_bse",),
+    "non_lle_bse": ("non_lle_bse",),
+    "low_energy_pair": ("se1", "se2"),
+    "energy_loss_pair": ("lle_bse", "non_lle_bse"),
+    "primary_pair": ("lle_bse", "non_lle_bse"),
+    "energy_cut_pair": ("sey_50ev", "bse_50ev"),
+    "all_disjoint": V062_DISJOINT_POPULATION_CHANNELS,
+    "v062_causal_lle": V062_DISJOINT_POPULATION_CHANNELS,
+}
+
 LEGACY_CHANNEL_SETS = {
     "se1": ("se1",),
     "se2": ("se2",),
@@ -459,10 +480,25 @@ class ProfileFitter:
         self.library = library
 
     @staticmethod
+    def _canonical_se_reference(value):
+        """Map historical SE-reference descriptions to stable identifiers."""
+        aliases = {
+            "immediate_parent_direction_vs_launch_surface_normal":
+                "launch_surface",
+            "immediate_parent_direction_vs_escape_surface_normal":
+                "escape_surface",
+        }
+        return aliases.get(value, value)
+
+    @staticmethod
     def _classifier_config(metadata, channels):
         config = metadata.get("classifier_config")
         if isinstance(config, Mapping):
-            return dict(config)
+            config = dict(config)
+            config["se_reference"] = ProfileFitter._canonical_se_reference(
+                config.get("se_reference")
+            )
+            return config
         definition = metadata.get("classifier")
         if definition is None:
             channel_set = set(channels)
@@ -470,13 +506,26 @@ class ProfileFitter:
                 definition = "branch_v1"
             elif {"lle_primary", "non_lle_primary"}.issubset(channel_set):
                 definition = "causal_lle_v2"
+            elif {"lle_bse", "non_lle_bse"}.issubset(channel_set):
+                definition = "causal_lle_v2"
         if definition is None:
             return {}
-        return {
+        is_v062 = {"lle_bse", "non_lle_bse"}.issubset(set(channels))
+        config = {
             "definition": definition,
             "bse_cutoff_ev": metadata.get("bse_cutoff_ev"),
-            "lle_max_loss_ev": metadata.get("lle_max_loss_ev"),
+            "lle_max_loss_ev": metadata.get(
+                "lle_max_loss_ev", metadata.get("low_loss_max_ev")
+            ),
+            "se_reference": (
+                metadata.get("se_reference")
+                or ("escape_surface" if is_v062 else None)
+            ),
         }
+        config["se_reference"] = ProfileFitter._canonical_se_reference(
+            config["se_reference"]
+        )
+        return config
 
     def compatibility_issues(self, observation: ProfileObservation):
         """Return scientific metadata mismatches that invalidate a fit."""
@@ -531,6 +580,15 @@ class ProfileFitter:
                 f"library={first_definition!r}, observation={second_definition!r}"
             )
         if first_definition == second_definition:
+            first_reference = library_classifier.get("se_reference")
+            second_reference = observation_classifier.get("se_reference")
+            if (first_reference is not None and second_reference is not None
+                    and first_reference != second_reference):
+                issues.append(
+                    "SE reference mismatch: "
+                    f"library={first_reference!r}, "
+                    f"observation={second_reference!r}"
+                )
             for key, label in (
                 ("bse_cutoff_ev", "SE/BSE cutoff"),
                 ("lle_max_loss_ev", "LLE maximum loss"),
@@ -804,6 +862,8 @@ def compare_channel_information(
         available = set(library.channels)
         if set(DISJOINT_POPULATION_CHANNELS).issubset(available):
             channel_sets = DEFAULT_CHANNEL_SETS
+        elif set(V062_DISJOINT_POPULATION_CHANNELS).issubset(available):
+            channel_sets = V062_CHANNEL_SETS
         elif set(LEGACY_DISJOINT_POPULATION_CHANNELS).issubset(available):
             channel_sets = LEGACY_CHANNEL_SETS
         else:
@@ -811,7 +871,13 @@ def compare_channel_information(
                 "the library contains neither the causal/LLE nor legacy "
                 "disjoint population basis"
             )
-    channel_sets = dict(channel_sets)
+    channel_sets = {
+        name: tuple(channels)
+        for name, channels in dict(channel_sets).items()
+        if set(channels).issubset(set(library.channels))
+    }
+    if not channel_sets:
+        raise ValueError("none of the requested channel sets is available")
     output = {}
     for name, channels in channel_sets.items():
         channels, indices = _channel_indices(library.channels, channels)
@@ -874,6 +940,8 @@ def compare_channel_information(
 __all__ = [
     "DEFAULT_CHANNEL_SETS",
     "LEGACY_CHANNEL_SETS",
+    "V062_CHANNEL_SETS",
+    "V062_DISJOINT_POPULATION_CHANNELS",
     "InformationResult",
     "PARAMETER_NAMES",
     "ProfileFitResult",

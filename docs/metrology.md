@@ -53,9 +53,14 @@ Older v1 NPZ files remain readable, but only their diagonal SEM variances are
 available, so the fit cannot recover correlations that were never saved.
 
 Before scoring, the fitter compares material, landing energy, beam FWHM,
-classifier definition, SE/BSE cutoff, and LLE threshold whenever those fields
-are present. Incompatible files are rejected by default. The override is meant
-for intentional cross-condition diagnostics, not ordinary metrology.
+classifier definition, SE reference surface, SE/BSE cutoff, and LLE threshold
+whenever those fields are present. Incompatible files are rejected by default.
+Historical descriptive SE-reference strings are canonicalized before this
+check, so the 0.7.0
+`immediate_parent_direction_vs_launch_surface_normal` value is equivalent to
+the current `launch_surface` identifier.
+The override is meant for intentional cross-condition diagnostics, not ordinary
+metrology.
 
 ## Channel basis
 
@@ -77,9 +82,10 @@ The information report also compares individual channels, the SE1/SE2 pair,
 the LLE/non-LLE pair, the conventional energy-cut SE/BSE pair, and all five
 disjoint populations.
 
-Legacy 0.6.x model libraries retain their `branch_v1` five-channel basis and
-can still be fitted. The CLI resolves `--channels all_disjoint` to the basis
-actually stored in the library.
+Legacy 0.6.1-era model libraries retain their `branch_v1` five-channel basis,
+while 0.6.2 libraries retain their `lle_bse`/`non_lle_bse` basis. Both can still
+be fitted. The CLI resolves `--channels all_disjoint` to the basis actually
+stored in the library.
 
 ## Local information estimate
 

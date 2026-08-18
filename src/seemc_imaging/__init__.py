@@ -48,9 +48,20 @@ from .trajectory import (
 )
 from .animation import animate_trapezoidal_scan
 
+from .plane_samplers import (
+    DEFAULT_INCIDENCE_ANGLES_DEG,
+    JMONSEL_ENERGIES_EV,
+    PlaneSamplerCase,
+    cosine_probability_grid,
+    generate_plane_sampler_library,
+    run_plane_sampler_case,
+)
+
 from .metrology import (
     DEFAULT_CHANNEL_SETS,
     LEGACY_CHANNEL_SETS,
+    V062_CHANNEL_SETS,
+    V062_DISJOINT_POPULATION_CHANNELS,
     InformationResult,
     PARAMETER_NAMES,
     ProfileFitResult,
@@ -72,6 +83,8 @@ __all__ = [
     "CHANNEL_DEFINITIONS",
     "DEFAULT_CHANNEL_SETS",
     "LEGACY_CHANNEL_SETS",
+    "V062_CHANNEL_SETS",
+    "V062_DISJOINT_POPULATION_CHANNELS",
     "DISJOINT_POPULATION_CHANNELS",
     "LEGACY_CHANNEL_DEFINITIONS",
     "LEGACY_DISJOINT_POPULATION_CHANNELS",
@@ -110,6 +123,12 @@ __all__ = [
     "compare_channel_information",
     "animate_trapezoidal_scan",
     "POINT_COLUMNS",
+    "DEFAULT_INCIDENCE_ANGLES_DEG",
+    "JMONSEL_ENERGIES_EV",
+    "PlaneSamplerCase",
+    "cosine_probability_grid",
+    "generate_plane_sampler_library",
+    "run_plane_sampler_case",
 ]
 
-__version__ = "0.7.0"
+__version__ = "0.7.4"
