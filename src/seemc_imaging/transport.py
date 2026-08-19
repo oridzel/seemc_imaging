@@ -211,6 +211,13 @@ class MCConfig:
     barrier_model: str = "abrupt"
     barrier_width: float = 0.0           # w in ANGSTROM, used by 'expqm' only
 
+    # Optional surface work-function override (eV).  This changes only the
+    # vacuum-level offset Phi and therefore Ui = E_F + Phi.  The material
+    # database Fermi energy is intentionally left unchanged, so bulk/FEG
+    # kinematics are not retuned when fitting the surface escape barrier.
+    # None means: use material_data['work_function'] exactly as before.
+    work_function_ev: Optional[float] = None
+
     # Apply the reciprocal vacuum->solid surface-barrier scattering to the
     # incident primary. Historically SEEMC refracted every primary into the
     # solid with probability 1, while the solid->vacuum barrier in Electron.escape()
@@ -312,6 +319,13 @@ class MCConfig:
                 "barrier_model='expqm' requires barrier_width > 0 (Angstrom); "
                 "use 'abrupt' for w->0 or 'classical' for w->infinity"
             )
+        if self.work_function_ev is not None:
+            self.work_function_ev = float(self.work_function_ev)
+            if (not math.isfinite(self.work_function_ev)
+                    or self.work_function_ev <= 0.0):
+                raise ValueError(
+                    "work_function_ev must be a finite positive value in eV"
+                )
         if self.se_channel_rule not in ("mao", "table"):
             raise ValueError(f"bad se_channel_rule: {self.se_channel_rule}")
         if self.elastic_low_energy_model not in ("elsepa", "browning", "linear"):
@@ -664,7 +678,12 @@ class Sample:
         self.Emax = float(self.Egrid[-1])
 
         self.e_fermi = float(md.get("e_fermi", 0.0))
-        self.work_function = float(md.get("work_function", 0.0))
+        self.work_function_db = float(md.get("work_function", 0.0))
+        self.work_function = float(
+            self.cfg.work_function_ev
+            if self.cfg.work_function_ev is not None
+            else self.work_function_db
+        )
         self.Ui = self.e_fermi + self.work_function     # VB bottom -> vacuum level
         self.e_vb = float(md.get("e_vb", 0.0))
 

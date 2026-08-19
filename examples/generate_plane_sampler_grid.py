@@ -83,6 +83,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="required only for --barrier-model expqm",
     )
     physics.add_argument(
+        "--work-function-ev", type=float, default=None,
+        help=(
+            "override only the material surface work function Phi (eV); "
+            "the database Fermi energy E_F is unchanged, so Ui=E_F+Phi. "
+            "Default: use MaterialDatabase.pkl"
+        ),
+    )
+    physics.add_argument(
         "--no-incoming-barrier-reflection", action="store_true",
         help=(
             "disable vacuum->solid quantum/specular reflection of incident "
@@ -116,62 +124,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _build_joint_exports_from_v2_cases(output_dir: Path) -> int:
-    """Build RFA-ready joint files from v2 raw checkpoints when available.
-
-    The actual per-case checkpoint is written inside ``plane_samplers.py``.
-    This finalizer deliberately refuses to invent phi from a legacy v1 file.
-    """
-    import numpy as np
-    try:
-        from seemc_imaging.plane_sampler_joint_export import write_joint_angle_samplers
-    except ImportError:
-        print(
-            "NOTE: plane_sampler_joint_export.py is not installed; legacy CSVs "
-            "were written, but joint RFA NPZ aggregation was skipped."
-        )
-        return 0
-
-    raw = sorted(Path(output_dir).rglob("E_*eV.npz"))
-    if not raw:
-        return 0
-
-    groups = {}
-    legacy = []
-    for path in raw:
-        try:
-            with np.load(path, allow_pickle=False) as data:
-                if "se_phi_deg" not in data.files or "bse_phi_deg" not in data.files:
-                    legacy.append(path)
-                    continue
-                angle = float(data["incidence_angle_deg"])
-        except Exception:
-            continue
-        groups.setdefault(angle, []).append(path)
-
-    if legacy:
-        print(
-            f"WARNING: {len(legacy)} raw checkpoint(s) are still v1 and contain "
-            "no phi/direction. Update seemc_imaging/plane_samplers.py to call "
-            "plane_sampler_joint_export.save_case_v2(); phi cannot be recovered "
-            "from those old files."
-        )
-
-    n_written = 0
-    for angle, paths in sorted(groups.items()):
-        # Put the joint files beside the raw cases. If a project uses a nested
-        # raw/ subdirectory, place them one level above it so they sit with the
-        # six legacy CSVs.
-        parent = paths[0].parent
-        target = parent.parent if parent.name.lower() in {"raw", "cases"} else parent
-        out = write_joint_angle_samplers(paths, target)
-        print(
-            f"Joint sampler {angle:g} deg: "
-            f"SE={out['SE'].name}, BSE={out['BSE'].name}"
-        )
-        n_written += 2
-    return n_written
-
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
@@ -184,6 +136,7 @@ def main(argv=None) -> int:
         elastic_cutoff_energy=args.elastic_cutoff_ev,
         barrier_model=args.barrier_model,
         barrier_width=args.barrier_width_angstrom,
+        work_function_ev=args.work_function_ev,
         incoming_barrier_reflection=not args.no_incoming_barrier_reflection,
         se_channel_rule=args.se_channel_rule,
         feg_fermi_energy=args.feg_fermi_energy_ev,
@@ -207,10 +160,10 @@ def main(argv=None) -> int:
         overwrite=args.overwrite,
         progress=not args.no_progress,
     )
-    n_joint = _build_joint_exports_from_v2_cases(args.output)
     print(
-        f"Wrote {len(cases)} cases, {len(angles)} angle directories, and "
-        f"a manifest under {args.output}; joint sampler files written: {n_joint}"
+        f"Wrote {len(cases)} cases, {len(angles)} angle directories, "
+        f"the six legacy CSVs, joint SE/BSE NPZ samplers, and a manifest "
+        f"under {args.output}"
     )
     return 0
 

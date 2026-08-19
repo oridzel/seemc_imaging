@@ -23,6 +23,10 @@ import numpy as np
 
 from .geometry import Plane
 from .transport import MCConfig, SEEMC
+from .plane_sampler_joint_export import (
+    direction_angles,
+    write_joint_angle_samplers,
+)
 
 
 JMONSEL_ENERGIES_EV = (
@@ -43,8 +47,8 @@ BSE_ENERGY_FILENAME = "BSEeEFromPlaneSampler_SEVaccum_t0nmCuFPA.csv"
 SE_THETA_FILENAME = "SEThetaFromPlaneSampler_uncoatedCuFPA.csv"
 BSE_THETA_FILENAME = "BSEThetaFromPlaneSampler_uncoatedCuFPA.csv"
 
-CHECKPOINT_SCHEMA = "seemc-plane-sampler-case-v1"
-PACKAGE_VERSION = "0.7.4"
+CHECKPOINT_SCHEMA = "seemc-plane-sampler-case-v2"
+PACKAGE_VERSION = "0.7.5"
 
 
 def cosine_probability_grid(size: int = 513) -> np.ndarray:
@@ -100,6 +104,24 @@ class PlaneSamplerCase:
     bse_energy_ev: np.ndarray
     se_theta_deg: np.ndarray
     bse_theta_deg: np.ndarray
+
+    # Event-level joint direction data.  Each row stays paired with the
+    # corresponding emitted energy and primary ID.
+    se_phi_deg: np.ndarray
+    bse_phi_deg: np.ndarray
+    se_direction_xyz: np.ndarray
+    bse_direction_xyz: np.ndarray
+    se_mu_beam_back: np.ndarray
+    bse_mu_beam_back: np.ndarray
+    se_mu_toward_normal: np.ndarray
+    bse_mu_toward_normal: np.ndarray
+    se_mu_side: np.ndarray
+    bse_mu_side: np.ndarray
+    se_emission_mechanism: np.ndarray
+    bse_emission_mechanism: np.ndarray
+    se_barrier_reflection_probability: np.ndarray
+    bse_barrier_reflection_probability: np.ndarray
+
     se_primary_id: np.ndarray
     bse_primary_id: np.ndarray
     se_counts_per_primary: np.ndarray
@@ -118,6 +140,17 @@ class PlaneSamplerCase:
         return self.sey + self.bsey
 
     @property
+    def incoming_barrier_reflections(self) -> int:
+        """Number of primaries reflected directly at the vacuum->solid barrier."""
+        return int(np.count_nonzero(
+            self.bse_emission_mechanism == "incoming_barrier_reflection"
+        ))
+
+    @property
+    def incoming_barrier_reflection_fraction(self) -> float:
+        return float(self.incoming_barrier_reflections / self.n_primaries)
+
+    @property
     def sey_sem(self) -> float:
         return _sem_from_counts(self.se_counts_per_primary)
 
@@ -131,21 +164,59 @@ class PlaneSamplerCase:
         if self.incident_energy_ev <= self.energy_cutoff_ev:
             raise ValueError("incident energy must exceed the SE/BSE cutoff")
         pairs = (
-            (self.se_energy_ev, self.se_theta_deg, self.se_primary_id, "SE"),
-            (self.bse_energy_ev, self.bse_theta_deg, self.bse_primary_id, "BSE"),
+            (
+                self.se_energy_ev, self.se_theta_deg, self.se_phi_deg,
+                self.se_direction_xyz, self.se_mu_beam_back,
+                self.se_mu_toward_normal, self.se_mu_side,
+                self.se_emission_mechanism,
+                self.se_barrier_reflection_probability,
+                self.se_primary_id, "SE",
+            ),
+            (
+                self.bse_energy_ev, self.bse_theta_deg, self.bse_phi_deg,
+                self.bse_direction_xyz, self.bse_mu_beam_back,
+                self.bse_mu_toward_normal, self.bse_mu_side,
+                self.bse_emission_mechanism,
+                self.bse_barrier_reflection_probability,
+                self.bse_primary_id, "BSE",
+            ),
         )
-        for energies, angles, primary_ids, label in pairs:
-            if energies.ndim != 1 or angles.ndim != 1 or primary_ids.ndim != 1:
-                raise ValueError(f"{label} raw arrays must be one-dimensional")
-            if not (energies.size == angles.size == primary_ids.size):
-                raise ValueError(f"{label} energy, angle, and ID lengths differ")
-            if not np.all(np.isfinite(energies)) or not np.all(np.isfinite(angles)):
+        for (
+            energies, theta, phi, directions, mu_b, mu_t, mu_s,
+            mechanism, barrier_r, primary_ids, label
+        ) in pairs:
+            one_d = (
+                energies, theta, phi, mu_b, mu_t, mu_s,
+                mechanism, barrier_r, primary_ids,
+            )
+            if any(array.ndim != 1 for array in one_d):
+                raise ValueError(f"{label} scalar raw arrays must be one-dimensional")
+            if directions.ndim != 2 or directions.shape[1] != 3:
+                raise ValueError(f"{label} direction array must have shape (N, 3)")
+            n = energies.size
+            if any(array.size != n for array in one_d[1:]) or directions.shape[0] != n:
+                raise ValueError(f"{label} joint emission-array lengths differ")
+            numeric = (energies, theta, phi, mu_b, mu_t, mu_s, directions)
+            if any(not np.all(np.isfinite(array)) for array in numeric):
                 raise ValueError(f"{label} raw arrays contain non-finite values")
+            # barrier_r is NaN for ordinary transport escapes and finite only
+            # for direct incoming-barrier reflections.
+            finite_r = np.isfinite(barrier_r)
+            if np.any(finite_r & ((barrier_r < 0.0) | (barrier_r > 1.0))):
+                raise ValueError(f"{label} barrier reflection probability is outside [0,1]")
             if primary_ids.size and (
                 int(primary_ids.min()) < 0
                 or int(primary_ids.max()) >= self.n_primaries
             ):
                 raise ValueError(f"{label} primary IDs are outside the case range")
+
+            if n:
+                norms = np.linalg.norm(directions, axis=1)
+                if not np.allclose(norms, 1.0, rtol=0.0, atol=2.0e-10):
+                    raise ValueError(f"{label} emitted directions are not unit vectors")
+                local_norm = np.sqrt(mu_b * mu_b + mu_t * mu_t + mu_s * mu_s)
+                if not np.allclose(local_norm, 1.0, rtol=0.0, atol=2.0e-10):
+                    raise ValueError(f"{label} local direction cosines are inconsistent")
         if self.se_counts_per_primary.shape != (self.n_primaries,):
             raise ValueError("SE per-primary counts have the wrong length")
         if self.bse_counts_per_primary.shape != (self.n_primaries,):
@@ -174,6 +245,68 @@ class PlaneSamplerCase:
                 "beam-relative polar angle lies outside the outward support "
                 f"[0, {theta_max:g}] degrees"
             )
+
+        # Reconstruct outward cosine directly from the beam-relative local
+        # components.  For incidence alpha:
+        #   n_out = cos(alpha)*beam_back + sin(alpha)*toward_normal.
+        alpha = math.radians(self.incidence_angle_deg)
+        ca, sa = math.cos(alpha), math.sin(alpha)
+        for mu_b, mu_t, label in (
+            (self.se_mu_beam_back, self.se_mu_toward_normal, "SE"),
+            (self.bse_mu_beam_back, self.bse_mu_toward_normal, "BSE"),
+        ):
+            outward_cos = ca * mu_b + sa * mu_t
+            if outward_cos.size and np.any(outward_cos <= -tolerance):
+                raise ValueError(
+                    f"{label} joint directions contain electrons pointing into the sample"
+                )
+
+        # Direct incoming-barrier reflections have an exact planar fingerprint:
+        # Eout=E0, theta=2*alpha, phi=0.  Enforce it so a future coordinate
+        # convention change cannot silently corrupt the sharp specular lobe.
+        if np.any(self.se_emission_mechanism == "incoming_barrier_reflection"):
+            raise ValueError(
+                "incoming-barrier reflected primaries must be BSE for this "
+                "sampler because incident_energy_ev exceeds the 50 eV cutoff"
+            )
+        reflected = (
+            self.bse_emission_mechanism == "incoming_barrier_reflection"
+        )
+        if np.any(reflected):
+            expected_theta = 2.0 * self.incidence_angle_deg
+            if not np.allclose(
+                self.bse_energy_ev[reflected],
+                self.incident_energy_ev,
+                rtol=0.0,
+                atol=max(tolerance, 1.0e-10),
+            ):
+                raise ValueError(
+                    "incoming-barrier reflected primary did not retain E0"
+                )
+            if not np.allclose(
+                self.bse_theta_deg[reflected],
+                expected_theta,
+                rtol=0.0,
+                atol=2.0e-9,
+            ):
+                raise ValueError(
+                    "incoming-barrier reflected primary is not at theta=2*alpha"
+                )
+            if not np.allclose(
+                self.bse_phi_deg[reflected],
+                0.0,
+                rtol=0.0,
+                atol=2.0e-9,
+            ):
+                raise ValueError(
+                    "incoming-barrier reflected primary is not at phi=0"
+                )
+            if not np.all(np.isfinite(
+                self.bse_barrier_reflection_probability[reflected]
+            )):
+                raise ValueError(
+                    "incoming-barrier reflected primary lacks its reflection probability"
+                )
 
 
 def _config_json(config: MCConfig) -> str:
@@ -232,25 +365,58 @@ def run_plane_sampler_case(
 
     emissions = model.emissions[0]
     if emissions:
-        emission_energy = np.asarray([item.energy for item in emissions], dtype=float)
-        emission_direction = np.asarray([item.uvw for item in emissions], dtype=float)
+        emission_energy = np.asarray(
+            [item.energy for item in emissions], dtype=float
+        )
+        emission_direction = np.asarray(
+            [item.uvw for item in emissions], dtype=float
+        )
         primary_id = np.asarray(
             [item.root_primary_id for item in emissions], dtype=np.int64
         )
-        norms = np.linalg.norm(emission_direction, axis=1)
-        if np.any(~np.isfinite(norms)) or np.any(norms <= 0.0):
-            raise ValueError("an emitted direction is non-finite or zero")
-        emission_direction = emission_direction / norms[:, None]
-        outward_cosine = emission_direction @ np.asarray(outward)
-        if np.any(outward_cosine <= -1.0e-12):
-            raise ValueError("transport returned an electron directed into the sample")
-        beam_cosine = np.clip(
-            emission_direction @ np.asarray(beam_back), -1.0, 1.0
+        (
+            emission_direction,
+            theta_deg,
+            phi_deg,
+            mu_beam_back,
+            mu_toward_normal,
+            mu_side,
+            outward_cosine,
+        ) = direction_angles(
+            emission_direction,
+            vacuum_incident_direction=vacuum,
+            surface_normal_out=outward,
         )
-        theta_deg = np.degrees(np.arccos(beam_cosine))
+        if np.any(outward_cosine <= -1.0e-12):
+            raise ValueError(
+                "transport returned an electron directed into the sample"
+            )
+        emission_mechanism = np.asarray(
+            [
+                str(getattr(item, "emission_mechanism", "transport_escape"))
+                for item in emissions
+            ]
+        )
+        barrier_reflection_probability = np.asarray(
+            [
+                np.nan
+                if getattr(item, "barrier_reflection_probability", None) is None
+                else float(item.barrier_reflection_probability)
+                for item in emissions
+            ],
+            dtype=float,
+        )
     else:
         emission_energy = np.empty(0, dtype=float)
+        emission_direction = np.empty((0, 3), dtype=float)
         theta_deg = np.empty(0, dtype=float)
+        phi_deg = np.empty(0, dtype=float)
+        mu_beam_back = np.empty(0, dtype=float)
+        mu_toward_normal = np.empty(0, dtype=float)
+        mu_side = np.empty(0, dtype=float)
+        outward_cosine = np.empty(0, dtype=float)
+        emission_mechanism = np.empty(0, dtype="<U1")
+        barrier_reflection_probability = np.empty(0, dtype=float)
         primary_id = np.empty(0, dtype=np.int64)
 
     is_se = emission_energy < config.bse_cutoff_ev
@@ -270,6 +436,20 @@ def run_plane_sampler_case(
         bse_energy_ev=emission_energy[~is_se],
         se_theta_deg=theta_deg[is_se],
         bse_theta_deg=theta_deg[~is_se],
+        se_phi_deg=phi_deg[is_se],
+        bse_phi_deg=phi_deg[~is_se],
+        se_direction_xyz=emission_direction[is_se],
+        bse_direction_xyz=emission_direction[~is_se],
+        se_mu_beam_back=mu_beam_back[is_se],
+        bse_mu_beam_back=mu_beam_back[~is_se],
+        se_mu_toward_normal=mu_toward_normal[is_se],
+        bse_mu_toward_normal=mu_toward_normal[~is_se],
+        se_mu_side=mu_side[is_se],
+        bse_mu_side=mu_side[~is_se],
+        se_emission_mechanism=emission_mechanism[is_se],
+        bse_emission_mechanism=emission_mechanism[~is_se],
+        se_barrier_reflection_probability=barrier_reflection_probability[is_se],
+        bse_barrier_reflection_probability=barrier_reflection_probability[~is_se],
         se_primary_id=se_ids,
         bse_primary_id=bse_ids,
         se_counts_per_primary=np.bincount(se_ids, minlength=n_primaries),
@@ -312,6 +492,11 @@ def save_case_checkpoint(path, case: PlaneSamplerCase, *, material: str,
         "material": str(material),
         "config_json": _config_json(config),
         "database_sha256": database_sha256,
+        "direction_convention": (
+            "beam_back=-incident vacuum direction; phi=0 toward the outward "
+            "sample normal in the incidence plane"
+        ),
+        "stores_joint_energy_direction": True,
     }
     temporary = path.with_suffix(path.suffix + ".tmp")
     with open(temporary, "wb") as stream:
@@ -327,6 +512,20 @@ def save_case_checkpoint(path, case: PlaneSamplerCase, *, material: str,
             bse_energy_ev=case.bse_energy_ev,
             se_theta_deg=case.se_theta_deg,
             bse_theta_deg=case.bse_theta_deg,
+            se_phi_deg=case.se_phi_deg,
+            bse_phi_deg=case.bse_phi_deg,
+            se_direction_xyz=case.se_direction_xyz,
+            bse_direction_xyz=case.bse_direction_xyz,
+            se_mu_beam_back=case.se_mu_beam_back,
+            bse_mu_beam_back=case.bse_mu_beam_back,
+            se_mu_toward_normal=case.se_mu_toward_normal,
+            bse_mu_toward_normal=case.bse_mu_toward_normal,
+            se_mu_side=case.se_mu_side,
+            bse_mu_side=case.bse_mu_side,
+            se_emission_mechanism=case.se_emission_mechanism,
+            bse_emission_mechanism=case.bse_emission_mechanism,
+            se_barrier_reflection_probability=case.se_barrier_reflection_probability,
+            bse_barrier_reflection_probability=case.bse_barrier_reflection_probability,
             se_primary_id=case.se_primary_id,
             bse_primary_id=case.bse_primary_id,
             se_counts_per_primary=case.se_counts_per_primary,
@@ -349,7 +548,11 @@ def load_case_checkpoint(path, *, material: Optional[str] = None,
     with np.load(path, allow_pickle=False) as archive:
         metadata = json.loads(str(archive["metadata_json"].item()))
         if metadata.get("schema") != CHECKPOINT_SCHEMA:
-            raise ValueError(f"unsupported checkpoint schema in {path}")
+            raise ValueError(
+                f"unsupported checkpoint schema in {path}; the joint-direction "
+                "sampler requires v2 checkpoints. Re-run this case with "
+                "overwrite=True (or use a fresh output directory)."
+            )
         if material is not None and metadata.get("material") != str(material):
             raise ValueError(f"checkpoint material mismatch in {path}")
         if config is not None and metadata.get("config_json") != _config_json(config):
@@ -367,6 +570,24 @@ def load_case_checkpoint(path, *, material: Optional[str] = None,
             bse_energy_ev=archive["bse_energy_ev"].astype(float),
             se_theta_deg=archive["se_theta_deg"].astype(float),
             bse_theta_deg=archive["bse_theta_deg"].astype(float),
+            se_phi_deg=archive["se_phi_deg"].astype(float),
+            bse_phi_deg=archive["bse_phi_deg"].astype(float),
+            se_direction_xyz=archive["se_direction_xyz"].astype(float),
+            bse_direction_xyz=archive["bse_direction_xyz"].astype(float),
+            se_mu_beam_back=archive["se_mu_beam_back"].astype(float),
+            bse_mu_beam_back=archive["bse_mu_beam_back"].astype(float),
+            se_mu_toward_normal=archive["se_mu_toward_normal"].astype(float),
+            bse_mu_toward_normal=archive["bse_mu_toward_normal"].astype(float),
+            se_mu_side=archive["se_mu_side"].astype(float),
+            bse_mu_side=archive["bse_mu_side"].astype(float),
+            se_emission_mechanism=archive["se_emission_mechanism"].astype(str),
+            bse_emission_mechanism=archive["bse_emission_mechanism"].astype(str),
+            se_barrier_reflection_probability=archive[
+                "se_barrier_reflection_probability"
+            ].astype(float),
+            bse_barrier_reflection_probability=archive[
+                "bse_barrier_reflection_probability"
+            ].astype(float),
             se_primary_id=archive["se_primary_id"].astype(np.int64),
             bse_primary_id=archive["bse_primary_id"].astype(np.int64),
             se_counts_per_primary=archive["se_counts_per_primary"].astype(np.int64),
@@ -509,10 +730,10 @@ def export_angle_tables(directory, cases: Sequence[PlaneSamplerCase],
         f">= {cutoff:g} eV.\n"
         "Theta is measured from the beam-back direction (opposite the incident "
         "vacuum ray), not from the sample normal.\n"
-        f"Physical polar support is 0 to {90.0 + angle:g} degrees. Polar angle "
-        "does not by itself enforce the outward half-space: when sampling "
-        "azimuth, reject or clip directions whose dot product with the sample "
-        "outward normal is not positive.\n",
+        f"Physical polar support is 0 to {90.0 + angle:g} degrees.\n"
+        "The legacy theta CSV is a marginal distribution only. For oblique "
+        "incidence use the event-level SE/BSE JointFromPlaneSampler NPZ files, "
+        "which preserve E, theta, phi, and direction correlations.\n",
         encoding="utf-8",
     )
     os.replace(temporary, readme)
@@ -532,8 +753,10 @@ def _write_manifest(path: Path, cases: Sequence[PlaneSamplerCase]) -> None:
         [],
         (
             "incidence_angle_deg", "incident_energy_ev", "n_primaries",
-            "case_seed", "se_emissions", "bse_emissions", "sey", "sey_sem",
-            "bsey", "bsey_sem", "tey",
+            "case_seed", "se_emissions", "bse_emissions",
+            "incoming_barrier_reflections",
+            "incoming_barrier_reflection_fraction",
+            "sey", "sey_sem", "bsey", "bsey_sem", "tey",
         ),
         (
             (
@@ -543,6 +766,8 @@ def _write_manifest(path: Path, cases: Sequence[PlaneSamplerCase]) -> None:
                 case.case_seed,
                 case.se_energy_ev.size,
                 case.bse_energy_ev.size,
+                case.incoming_barrier_reflections,
+                _format_number(case.incoming_barrier_reflection_fraction),
                 _format_number(case.sey),
                 _format_number(case.sey_sem),
                 _format_number(case.bsey),
@@ -638,10 +863,28 @@ def generate_plane_sampler_library(
                 )
             cases.append(case)
             angle_cases.append(case)
+        angle_output = output / angle_directory_name(angle)
         export_angle_tables(
-            output / angle_directory_name(angle), angle_cases,
+            angle_output, angle_cases,
             material=material, probabilities=probabilities,
         )
+
+        # Aggregate the event-level v2 checkpoints into the two files consumed
+        # directly by the RFA joint sampler.  No marginalisation or new random
+        # azimuth is introduced here.
+        angle_case_paths = [
+            checkpoint_path(output, angle, case.incident_energy_ev)
+            for case in angle_cases
+        ]
+        joint_paths = write_joint_angle_samplers(
+            angle_case_paths, angle_output
+        )
+        if status is not None:
+            status(
+                f"joint alpha={angle:g} deg: "
+                f"SE={joint_paths['SE'].name}, "
+                f"BSE={joint_paths['BSE'].name}"
+            )
 
     _write_manifest(output / "sampler_manifest.csv", cases)
     generation = {
@@ -673,10 +916,24 @@ def generate_plane_sampler_library(
         "angle_convention": {
             "polar_axis": "beam-back direction (-incident vacuum direction)",
             "support_deg": "0 .. 90 + incidence_angle_deg",
-            "azimuth_requirement": (
-                "sample only directions with dot(direction, outward_normal) > 0"
+            "phi_zero": (
+                "incidence-plane direction from beam-back axis toward "
+                "the sample outward normal"
+            ),
+            "phi_handedness": "right-handed about the beam-back axis",
+            "raw_joint_direction": (
+                "each emitted electron retains paired E, theta, phi, and "
+                "direction cosines; no uniform-azimuth reconstruction"
             ),
         },
+        "joint_sampler_files": {
+            "SE": "SEJointFromPlaneSampler_uncoatedCuFPA.npz",
+            "BSE": "BSEJointFromPlaneSampler_uncoatedCuFPA.npz",
+            "schema": "seemc-joint-emission-v1",
+        },
+        "incoming_barrier_reflection": bool(
+            getattr(config, "incoming_barrier_reflection", False)
+        ),
         "mc_config": asdict(config),
         "mc_config_sha256": _config_sha256(config),
     }
