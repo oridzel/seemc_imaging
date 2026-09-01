@@ -1019,32 +1019,106 @@ class Sample:
     # ------------------------------------------------------------------
     def _build_elf_channel_splines(self):
         md = self.material_data
-        omega_h = np.asarray(md["omega"], float) / H2EV
-        q_raw = np.asarray(md["q"], float)
-        # ONE declared unit for the whole module (the old code read this key as
-        # A^-1 in elf_spline() and as a0^-1 in elf_channel_splines()).
-        q_a0inv = q_raw if self.cfg.q_unit == "a0^-1" else q_raw * A0_ANG
-        if np.any(q_a0inv <= 0):
-            raise ValueError("material_data['q'] must be strictly positive for log-q sampling")
-        qlog = np.log(q_a0inv)
 
-        elf_se = np.asarray(md["elf_se"], float)
-        elf_pl = np.asarray(md["elf_pl"], float)
-        if elf_se.shape != (omega_h.size, qlog.size):
-            if elf_se.shape == (qlog.size, omega_h.size):
+        omega_h = np.asarray(md["omega"], dtype=np.float64) / H2EV
+        q_raw = np.asarray(md["q"], dtype=np.float64)
+
+        # Convert the database q grid to a0^-1.
+        q_a0inv = (
+            q_raw
+            if self.cfg.q_unit == "a0^-1"
+            else q_raw * A0_ANG
+        )
+
+        if np.any(q_a0inv <= 0):
+            raise ValueError(
+                "material_data['q'] must be strictly positive "
+                "for log-q sampling"
+            )
+
+        elf_se = np.asarray(md["elf_se"], dtype=np.float64)
+        elf_pl = np.asarray(md["elf_pl"], dtype=np.float64)
+
+        # Orient ELF arrays using the ORIGINAL q-grid length first.
+        nq_raw = q_a0inv.size
+
+        if elf_se.shape != (omega_h.size, nq_raw):
+            if elf_se.shape == (nq_raw, omega_h.size):
                 elf_se = elf_se.T
                 elf_pl = elf_pl.T
             else:
                 raise ValueError(
-                    f"ELF shape {elf_se.shape} matches neither (Nw, Nq) = "
-                    f"({omega_h.size}, {qlog.size}) nor its transpose"
+                    f"ELF shape {elf_se.shape} matches neither "
+                    f"(Nw, Nq)=({omega_h.size}, {nq_raw}) "
+                    f"nor its transpose"
                 )
+
+        if elf_pl.shape != elf_se.shape:
+            raise ValueError(
+                f"elf_pl shape {elf_pl.shape} does not match "
+                f"elf_se shape {elf_se.shape}"
+            )
+
+        # q may contain the almost-identical linear/log splice points.
+        if np.any(np.diff(q_a0inv) < 0.0):
+            raise ValueError(
+                "material_data['q'] must be monotonically increasing"
+            )
+
+        qlog = np.log(q_a0inv)
+
+        # Two distinct q values can collapse to exactly the same float64
+        # after log(). RectBivariateSpline requires strict monotonicity.
+        keep = np.ones(qlog.size, dtype=bool)
+        keep[1:] = np.diff(qlog) > 0.0
+
+        n_removed = int(np.count_nonzero(~keep))
+
+        if n_removed:
+            bad = np.flatnonzero(~keep)
+
+            details = ", ".join(
+                f"i={i}: q={q_raw[i]:.17g}"
+                for i in bad[:5]
+            )
+
+            warnings.warn(
+                f"Removed {n_removed} duplicate log-q grid point(s) "
+                f"from material '{self.name}' before building ELF "
+                f"splines ({details})",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+            # CRITICAL: delete the matching ELF columns too.
+            qlog = qlog[keep]
+            elf_se = elf_se[:, keep]
+            elf_pl = elf_pl[:, keep]
+
+        if qlog.size < 2 or not np.all(np.diff(qlog) > 0.0):
+            raise ValueError(
+                "ELF q grid is not strictly increasing "
+                "after duplicate cleanup"
+            )
 
         self._omega_h_grid = omega_h
         self._qlog_grid = qlog
+
         self._elf_spl = {
-            "se": RectBivariateSpline(omega_h, qlog, elf_se, kx=1, ky=1),
-            "pl": RectBivariateSpline(omega_h, qlog, elf_pl, kx=1, ky=1),
+            "se": RectBivariateSpline(
+                omega_h,
+                qlog,
+                elf_se,
+                kx=1,
+                ky=1,
+            ),
+            "pl": RectBivariateSpline(
+                omega_h,
+                qlog,
+                elf_pl,
+                kx=1,
+                ky=1,
+            ),
         }
 
     def mao_q_boundaries(self, omega):

@@ -21,7 +21,32 @@ from seemc_imaging.transport import MCConfig
 from synthetic_material import write_synthetic_database
 
 
+def _local_cosines(theta_deg, phi_deg):
+    """Beam-relative local direction cosines (beam_back, toward_normal, side).
+
+    ``validate`` requires these three to square-sum to one and reconstructs the
+    outward cosine as cos(alpha)*beam_back + sin(alpha)*toward_normal.
+    """
+    theta = np.radians(np.asarray(theta_deg, dtype=float))
+    phi = np.radians(np.asarray(phi_deg, dtype=float))
+    return np.stack([
+        np.cos(theta),
+        np.sin(theta) * np.cos(phi),
+        np.sin(theta) * np.sin(phi),
+    ], axis=1)
+
+
 def _case():
+    # Angles chosen so every emitted direction has a non-negative outward
+    # cosine at 75 degrees incidence.  The second BSE is a direct
+    # incoming-barrier reflection, which must carry the exact planar
+    # fingerprint E_out = E0, theta = 2*alpha, phi = 0.
+    se_theta = np.array([5.0, 70.0, 160.0])
+    se_phi = np.array([0.0, 90.0, 0.0])
+    bse_theta = np.array([20.0, 150.0])
+    bse_phi = np.array([45.0, 0.0])
+    se_local = _local_cosines(se_theta, se_phi)
+    bse_local = _local_cosines(bse_theta, bse_phi)
     case = PlaneSamplerCase(
         incidence_angle_deg=75.0,
         incident_energy_ev=500.0,
@@ -29,9 +54,27 @@ def _case():
         case_seed=123,
         energy_cutoff_ev=50.0,
         se_energy_ev=np.array([1.0, 10.0, 49.0]),
-        bse_energy_ev=np.array([50.0, 450.0]),
-        se_theta_deg=np.array([5.0, 70.0, 160.0]),
-        bse_theta_deg=np.array([20.0, 150.0]),
+        bse_energy_ev=np.array([450.0, 500.0]),
+        se_theta_deg=se_theta,
+        bse_theta_deg=bse_theta,
+        se_phi_deg=se_phi,
+        bse_phi_deg=bse_phi,
+        # This fixture's lab frame coincides with the beam-relative frame, so
+        # the unit direction vectors are the local cosines themselves.
+        se_direction_xyz=se_local,
+        bse_direction_xyz=bse_local,
+        se_mu_beam_back=se_local[:, 0],
+        bse_mu_beam_back=bse_local[:, 0],
+        se_mu_toward_normal=se_local[:, 1],
+        bse_mu_toward_normal=bse_local[:, 1],
+        se_mu_side=se_local[:, 2],
+        bse_mu_side=bse_local[:, 2],
+        se_emission_mechanism=np.array(["transport_escape"] * 3),
+        bse_emission_mechanism=np.array(
+            ["transport_escape", "incoming_barrier_reflection"]
+        ),
+        se_barrier_reflection_probability=np.full(3, np.nan),
+        bse_barrier_reflection_probability=np.array([np.nan, 0.25]),
         se_primary_id=np.array([0, 0, 3]),
         bse_primary_id=np.array([1, 3]),
         se_counts_per_primary=np.array([2, 0, 0, 1]),

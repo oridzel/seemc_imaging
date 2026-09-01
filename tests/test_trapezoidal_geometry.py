@@ -157,27 +157,41 @@ def test_complete_transport_on_line_records_exposed_surfaces(
     sample = Sample("Synthetic", db_path=db_path)
     line = _line()
     launch = line.surface_point(x)
-    result = simulate_trajectory(
-        sample,
-        500.0,
-        0.0,
-        np.random.default_rng(42),
-        history=True,
-        geometry=line,
-        launch_position=launch,
-        vacuum_direction=(0.0, 0.0, 1.0),
-    )
 
-    assert result.history.launch_position == launch
-    assert result.history.incident_angle == pytest.approx(expected_angle, abs=1e-15)
-    assert result.tey > 0
-    assert all(not emission.surface_id.endswith(".base")
-               for emission in result.emissions)
-    assert all(np.dot(emission.uvw, emission.surface_normal) > 0.0
-               for emission in result.emissions)
-    boundary_events = [
-        event for event in result.history.events
-        if event.kind in {"emission", "surface_reflection"}
-    ]
-    assert boundary_events
-    assert all(not event.surface_id.endswith(".base") for event in boundary_events)
+    # A single 500 eV primary is not guaranteed to emit anything -- on the
+    # sidewall it is frequently absorbed -- so the emission assertions run over
+    # a small ensemble.  The per-trajectory geometry assertions still hold for
+    # every seed.
+    total_tey = 0
+    total_boundary_events = 0
+    for seed in range(16):
+        result = simulate_trajectory(
+            sample,
+            500.0,
+            0.0,
+            np.random.default_rng(seed),
+            history=True,
+            geometry=line,
+            launch_position=launch,
+            vacuum_direction=(0.0, 0.0, 1.0),
+        )
+
+        assert result.history.launch_position == launch
+        assert result.history.incident_angle == pytest.approx(
+            expected_angle, abs=1e-15
+        )
+        assert all(not emission.surface_id.endswith(".base")
+                   for emission in result.emissions)
+        assert all(np.dot(emission.uvw, emission.surface_normal) > 0.0
+                   for emission in result.emissions)
+        boundary_events = [
+            event for event in result.history.events
+            if event.kind in {"emission", "surface_reflection"}
+        ]
+        assert all(not event.surface_id.endswith(".base")
+                   for event in boundary_events)
+        total_tey += result.tey
+        total_boundary_events += len(boundary_events)
+
+    assert total_tey > 0
+    assert total_boundary_events > 0

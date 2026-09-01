@@ -32,14 +32,28 @@ def main():
     parser.add_argument("--energy-ev", type=float, default=1000.0)
     parser.add_argument(
         "--lle-max-loss-ev", "--low-loss-max-ev",
-        dest="lle_max_loss_ev", type=float, default=50.0,
-        help="maximum vacuum energy loss for the LLE primary channel",
+        dest="lle_max_loss_ev", type=float, default=None,
+        help=(
+            "absolute maximum vacuum energy loss for the LLE primary channel "
+            "(default 50 eV; mutually exclusive with --lle-max-loss-frac)"
+        ),
+    )
+    parser.add_argument(
+        "--lle-max-loss-frac",
+        dest="lle_max_loss_frac", type=float, default=None,
+        help=(
+            "LLE threshold as a fraction of E0, e.g. 0.02 for E/E0 > 0.98; "
+            "use this instead of --lle-max-loss-ev when sweeping beam energy"
+        ),
     )
     parser.add_argument(
         "--population-definition",
-        choices=("causal_lle_v2", "branch_v1"),
-        default="causal_lle_v2",
-        help="use branch_v1 only to reproduce legacy 0.6.1-era outputs",
+        choices=("causal_lle_v3", "causal_lle_v2", "branch_v1"),
+        default="causal_lle_v3",
+        help=(
+            "causal_lle_v2 and branch_v1 reproduce archived 0.7.x and "
+            "0.6.1-era outputs; new work should use causal_lle_v3"
+        ),
     )
     parser.add_argument(
         "--se-reference",
@@ -48,6 +62,17 @@ def main():
         help=(
             "surface normal used for causal SE1/SE2; escape_surface "
             "reproduces the 0.6.2 classifier"
+        ),
+    )
+    parser.add_argument(
+        "--se-parent-rule",
+        choices=("root_primary_leg", "immediate_parent"),
+        default=None,
+        help=(
+            "whose direction decides SE1/SE2: the root incident electron's "
+            "own leg (default for causal_lle_v3, and the conventional "
+            "literature meaning) or the immediate energetic parent, which may "
+            "itself be a cascade electron (default for causal_lle_v2)"
         ),
     )
     parser.add_argument("--top-width-nm", type=float, default=50.0)
@@ -113,8 +138,14 @@ def main():
         parser.error("--nx must be >=2; --ny and --primaries-per-pixel must be >=1")
     if args.beam_fwhm_nm < 0.0:
         parser.error("--beam-fwhm-nm must be non-negative")
-    if args.lle_max_loss_ev < 0.0:
+    if args.lle_max_loss_ev is not None and args.lle_max_loss_frac is not None:
+        parser.error(
+            "give --lle-max-loss-ev or --lle-max-loss-frac, not both"
+        )
+    if args.lle_max_loss_ev is not None and args.lle_max_loss_ev < 0.0:
         parser.error("--lle-max-loss-ev must be non-negative")
+    if args.lle_max_loss_frac is not None and not 0.0 <= args.lle_max_loss_frac <= 1.0:
+        parser.error("--lle-max-loss-frac must lie within [0, 1]")
     if args.record_primaries_per_pixel is not None:
         if not args.record_trajectories:
             parser.error(
@@ -165,8 +196,10 @@ def main():
     classifier = PopulationClassifier(
         bse_cutoff_ev=sample.cfg.bse_cutoff_ev,
         lle_max_loss_ev=args.lle_max_loss_ev,
+        lle_max_loss_frac=args.lle_max_loss_frac,
         definition=args.population_definition,
         se_reference=args.se_reference,
+        se_parent_rule=args.se_parent_rule,
     )
     result = RasterDriver(sample, line, config, classifier).run(
         use_parallel=args.parallel,

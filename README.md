@@ -40,15 +40,22 @@ The package currently contains:
 
 Detector response is deliberately not hard-coded yet. The event history is the
 raw evidence from which alternative population definitions can be compared.
-Version 0.7.3 separates causal taxonomy from expected spatial resolution and
-experimental filtering. Its default `causal_lle_v2` classifier uses the
-immediate energetic parent's direction for SE1/SE2 and an explicit vacuum
-energy-loss threshold for LLE/non-LLE emitted primaries. It merges the 0.6.2
-escape-surface SE reference as an optional, metadata-tracked classifier while
-retaining the 0.7.0 launch-surface default. Strict first-event BSE
-is an overlapping diagnostic, not a synonym for LLE. The former `branch_v1`
-classifier remains available solely to reproduce 0.6.1-era results. Version
-0.6.2 is reproduced with `--se-reference escape_surface`.
+Version 0.7.5 separates causal taxonomy from expected spatial resolution and
+experimental filtering. Its default `causal_lle_v3` classifier decides SE1/SE2
+from a parent direction relative to a declared reference normal, with no
+spatial, energy-loss, or resolution term, and crosses that causal class with
+the emitted-energy cut rather than being gated by it -- so `se1` and `se2` mean
+the whole causal class and `se1_lt50`/`se2_lt50` its sub-cutoff part.
+`se_parent_rule` selects whose direction decides: the root incident electron's
+own leg (default, the conventional literature meaning) or the immediate
+energetic parent, which may itself be a cascade electron. LLE/non-LLE remains
+an explicit vacuum energy-loss window on emitted primaries -- a filter class,
+not a BSE subspecies -- and its threshold may now be absolute
+(`--lle-max-loss-ev`) or a fraction of E0 (`--lle-max-loss-frac`). Strict
+first-event backscatter and barrier-reflected primaries are overlapping
+diagnostics, not synonyms for LLE. `causal_lle_v2` reproduces the 0.7.x default
+and `branch_v1` the 0.6.1-era results; 0.6.2 is `causal_lle_v2` with
+`--se-reference escape_surface`.
 
 ## Installation
 
@@ -61,13 +68,17 @@ with the corrected optlib table conventions.
 
 ### Earlier-version migration
 
-Do not discard an earlier raster or model library. Version 0.7.3 recognizes
-both historical branches:
+Do not discard an earlier raster or model library. Version 0.7.5 recognizes
+every historical branch:
 
+- 0.7.x `causal_lle_v2` archives retain energy-gated `se1`/`se2` and the
+  immediate-parent rule. Reproduce them with
+  `--population-definition causal_lle_v2`.
 - 0.6.1-era `branch_v1` archives retain SE1/SE2/BSE1/BSE2. Reproduce them with
   `--population-definition branch_v1`.
 - 0.6.2 archives retain `lle_bse`/`non_lle_bse` and the escape-surface SE
-  reference. Reproduce that classifier with `--se-reference escape_surface`.
+  reference. Reproduce that classifier with
+  `--population-definition causal_lle_v2 --se-reference escape_surface`.
 
 The fitter resolves `--channels all_disjoint` to the basis actually stored in
 the library. The animation `populations` preset also adapts to current, 0.6.2,
@@ -78,10 +89,12 @@ The fitter also canonicalizes the 0.7.0 metadata description
 Those terms encode the same SE1/SE2 reference and can therefore be compared
 without `--allow-incompatible`.
 
-New simulations default to `causal_lle_v2`. A new observation and its model
-library must use the same classifier, SE reference, and LLE threshold. The fitter rejects
-old/new classifier mixtures instead of silently comparing identically named
-SE channels with different operational definitions.
+New simulations default to `causal_lle_v3`. A new observation and its model
+library must use the same classifier, SE reference, SE parent rule, and LLE
+criterion and threshold. The fitter rejects old/new classifier mixtures instead
+of silently comparing identically named SE channels with different operational
+definitions -- `se1` in particular means the energy-gated sub-cutoff class in a
+`causal_lle_v2` archive and the whole causal class in a `causal_lle_v3` one.
 
 ## Record one cascade
 
@@ -223,7 +236,8 @@ result.save_csv("trapezoidal_raster.csv")
 ```
 
 Every population has `count_maps`, `yield_maps`, and `sem_maps`. For example,
-`result.yield_maps["se1"]` is the causal incoming-parent SE1 yield image, while
+`result.yield_maps["se1"]` is the causal SE1 yield image at any emitted energy
+and `result.yield_maps["se1_lt50"]` its sub-cutoff part, while
 `result.yield_maps["lle_primary"]` is the energy-filterable low-loss original-
 primary image and
 `result.yield_maps["sey_50ev"]` retains the conventional energy-cut SE image.
@@ -285,14 +299,16 @@ python examples/animate_trapezoidal_scan.py \
   --profile-channels populations
 ```
 
-Use `--color-by population` for fixed SE1/SE2/fast-cascade/LLE/non-LLE colors,
+Use `--color-by population` for fixed SE1/SE2/LLE/non-LLE colors,
 or choose a `.gif` output when ffmpeg is unavailable. The lower panel defaults
 to the four population-resolved yields SE1, SE2, LLE, and non-LLE. Select only
 conventional energy-cut signals with `--profile-channels conventional`, restore
 the original three curves with `--profile-channels tey_se_bse`, or provide an
 explicit comma-separated list such as
-`--profile-channels se1,se2,lle_primary,non_lle_primary`. Legacy trajectory
-archives automatically use their former SE1/SE2/BSE1/BSE2 preset.
+`--profile-channels se1,se2,lle_primary,non_lle_primary`, or select the six
+mutually exclusive channels with `--profile-channels populations_disjoint`.
+Legacy trajectory archives automatically use their former SE1/SE2/BSE1/BSE2
+preset.
 The MP4 writer automatically pads odd image dimensions by one pixel for H.264
 compatibility. The renderer preserves
 the relative femtosecond timing within each independently simulated primary
@@ -301,6 +317,65 @@ ensemble; they do not share an experimental absolute time origin. The straight
 vacuum continuation after emission is added only for visualization and does
 not alter transport or yield results. Install the optional renderer with
 `python -m pip install -e '.[animation]'`.
+
+## Suspended membrane and the transmitted (STEM) signal
+
+`TrapezoidalLine` sits on a semi-infinite substrate, so nothing can leave
+through the far side. `SuspendedTrapezoidalLine` replaces that substrate with a
+finite `Slab`, giving the specimen an underside and making a transmitted signal
+possible:
+
+```python
+import math
+from seemc_imaging import (
+    PopulationClassifier, RasterConfig, RasterDriver, Sample,
+    SuspendedTrapezoidalLine, TransmissionDetector,
+)
+
+height, membrane = 300.0, 1000.0                  # Angstrom: 30 nm line, 100 nm film
+top = 500.0                                       # 50 nm wide line
+bottom = top + 2.0 * height * math.tan(math.radians(2.0))   # 2 deg sidewall
+
+line = SuspendedTrapezoidalLine(
+    top_width=top, bottom_width=bottom,
+    height=height, membrane_thickness=membrane,
+)
+classifier = PopulationClassifier(
+    lle_max_loss_frac=0.02,                       # E/E0 > 0.98, scales with kV
+    transmission=TransmissionDetector(
+        bf_max_mrad=10.0, adf_max_mrad=50.0, haadf_max_mrad=200.0,
+    ),
+)
+```
+
+An emitted electron is *forward* when its emitted velocity has a component
+along the incident beam, and *backward* otherwise, so the split follows the
+electron rather than which face it crossed. The reflected hemisphere keeps the
+full causal taxonomy (`back_se1_lt50` … `back_non_lle_primary`) while the
+transmitted hemisphere is segmented by collection angle (`fwd_bf`, `fwd_adf`,
+`fwd_haadf`, `fwd_beyond_haadf`); the ten channels partition TEY exactly.
+`backward_all` and `forward_all` give the hemisphere totals, and `se1`, `se2`,
+`lle_primary` and the other unprefixed aggregates still count both hemispheres.
+
+The ring bounds are collection angles, not a detector response — solid angle,
+gain, and real holder geometry are forward-model steps applied afterwards.
+`fwd_bf_primary` counts only original incident electrons inside the BF angle,
+so comparing it with `fwd_bf` exposes secondary-electron contamination of the
+bright-field disc.
+
+Run a two-energy line scan across such a specimen with:
+
+```bash
+python examples/suspended_line_stem_linescan.py MaterialDatabase.pkl \
+  --material Si --energies-kv 0.9,30 \
+  --top-width-nm 50 --sidewall-deg 2 \
+  --line-height-nm 30 --membrane-thickness-nm 100 \
+  --beam-fwhm-nm 1.6 --field-width-nm 120 --nx 241 \
+  --primaries-per-pixel 400 --parallel --output-prefix si_line
+```
+
+Landing energies above the material table's range are warned about rather than
+silently clamped to the table maximum, which matters when going to 30 kV.
 
 ## Trapezoid metrology sweep and joint fit
 
@@ -335,9 +410,9 @@ python examples/fit_trapezoidal_profile.py \
   --plot --output-prefix trapezoid_fit
 ```
 
-The default joint basis is `se1`, `se2`, `fast_cascade_ge50`, `lle_primary`,
-and `non_lle_primary`. These five populations are mutually exclusive and
-partition TEY, so
+The default joint basis is `se1_lt50`, `se1_ge50`, `se2_lt50`, `se2_ge50`,
+`lle_primary`, and `non_lle_primary`. These six populations are mutually
+exclusive and partition TEY, so
 their full covariance can be used without treating overlapping channels as
 independent measurements. The fitter searches the discrete geometry library,
 profiles a global yield scale and lateral shift, and can optionally fit one

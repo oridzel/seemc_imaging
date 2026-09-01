@@ -517,6 +517,161 @@ class TrapezoidalPrism:
 
 
 @dataclass(frozen=True)
+class Slab:
+    """An infinite solid slab bounded by two planes normal to ``z``.
+
+    The slab occupies ``top_z <= z <= top_z + thickness``.  Unlike
+    :class:`Plane`, which is semi-infinite, this primitive has a second exposed
+    face, so an electron can leave through the bottom.  That is what makes a
+    transmitted (STEM) signal possible at all.
+    """
+
+    top_z: float = 0.0
+    thickness: float = 1.0
+    surface_id: str = "membrane"
+    solid_region: str = SOLID_REGION
+    vacuum_region: str = VACUUM_REGION
+    direction_epsilon: float = 1e-15
+    boundary_tolerance: float = 1e-9
+    _faces: tuple = field(init=False, repr=False)
+
+    def __post_init__(self):
+        top_z = float(self.top_z)
+        thickness = float(self.thickness)
+        epsilon = float(self.direction_epsilon)
+        tolerance = float(self.boundary_tolerance)
+        if not all(math.isfinite(value)
+                   for value in (top_z, thickness, epsilon, tolerance)):
+            raise ValueError("slab parameters must be finite")
+        if thickness <= 0.0:
+            raise ValueError("thickness must be positive")
+        if epsilon < 0.0 or tolerance <= 0.0:
+            raise ValueError("geometry tolerances must be positive")
+        if str(self.solid_region) == str(self.vacuum_region):
+            raise ValueError("solid_region and vacuum_region must differ")
+
+        object.__setattr__(self, "top_z", top_z)
+        object.__setattr__(self, "thickness", thickness)
+        object.__setattr__(self, "surface_id", str(self.surface_id))
+        object.__setattr__(self, "solid_region", str(self.solid_region))
+        object.__setattr__(self, "vacuum_region", str(self.vacuum_region))
+        object.__setattr__(self, "direction_epsilon", epsilon)
+        object.__setattr__(self, "boundary_tolerance", tolerance)
+
+        faces = (
+            ((0.0, 0.0, top_z), (0.0, 0.0, -1.0), "top", 0),
+            ((0.0, 0.0, top_z + thickness), (0.0, 0.0, 1.0), "bottom", 1),
+        )
+        object.__setattr__(self, "_faces", faces)
+
+    @property
+    def bottom_z(self):
+        return self.top_z + self.thickness
+
+    def _face_value(self, point, face):
+        point_on_face, normal, _, _ = face
+        return _dot(tuple(point[i] - point_on_face[i] for i in range(3)), normal)
+
+    def region_at(self, point) -> str:
+        point = _vec3(point, "point")
+        tolerance = self.boundary_tolerance
+        inside = all(
+            self._face_value(point, face) <= tolerance for face in self._faces
+        )
+        return self.solid_region if inside else self.vacuum_region
+
+    def candidate_hits(self, origin, direction, max_distance):
+        origin = _vec3(origin, "origin")
+        direction = _vec3(direction, "direction")
+        max_distance = float(max_distance)
+        if math.isnan(max_distance) or max_distance < 0.0:
+            raise ValueError("max_distance must be non-negative and not NaN")
+
+        hits = []
+        tolerance = self.boundary_tolerance
+        for face in self._faces:
+            point_on_face, normal, label, face_id = face
+            denominator = _dot(direction, normal)
+            if abs(denominator) <= self.direction_epsilon:
+                continue
+            numerator = _dot(
+                tuple(point_on_face[i] - origin[i] for i in range(3)), normal
+            )
+            distance = numerator / denominator
+            if distance < 0.0 or not distance < max_distance:
+                continue
+            raw = _add_scaled(origin, direction, distance)
+            residual = self._face_value(raw, face)
+            position = tuple(
+                raw[index] - residual * normal[index] for index in range(3)
+            )
+            if all(
+                self._face_value(position, other) <= tolerance
+                for other in self._faces
+            ):
+                hits.append(_SurfaceCandidate(
+                    distance=distance,
+                    position=position,
+                    outward_normal=normal,
+                    surface_id=f"{self.surface_id}.{label}",
+                    primitive_id=face_id,
+                ))
+        return hits
+
+    def surface_candidates_at(self, point, tolerance=None):
+        point = _vec3(point, "point")
+        tolerance = self.boundary_tolerance if tolerance is None else float(tolerance)
+        if self.region_at(point) != self.solid_region:
+            if any(self._face_value(point, face) > tolerance
+                   for face in self._faces):
+                return []
+        return [
+            _SurfaceCandidate(
+                distance=0.0,
+                position=point,
+                outward_normal=face[1],
+                surface_id=f"{self.surface_id}.{face[2]}",
+                primitive_id=face[3],
+            )
+            for face in self._faces
+            if abs(self._face_value(point, face)) <= tolerance
+        ]
+
+    def first_hit(self, origin, direction, max_distance,
+                  current_region) -> Optional[SurfaceHit]:
+        current_region = str(current_region)
+        if current_region not in (self.solid_region, self.vacuum_region):
+            raise ValueError(
+                f"Slab does not contain current_region={current_region!r}"
+            )
+        for candidate in sorted(
+                self.candidate_hits(origin, direction, max_distance),
+                key=lambda item: item.distance):
+            projection = _dot(_vec3(direction, "direction"),
+                              candidate.outward_normal)
+            if current_region == self.solid_region:
+                if projection <= self.direction_epsilon:
+                    continue
+                normal = candidate.outward_normal
+                next_region = self.vacuum_region
+            else:
+                if projection >= -self.direction_epsilon:
+                    continue
+                normal = tuple(-value for value in candidate.outward_normal)
+                next_region = self.solid_region
+            return SurfaceHit(
+                distance=candidate.distance,
+                position=candidate.position,
+                normal=normal,
+                surface_id=candidate.surface_id,
+                region_from=current_region,
+                region_to=next_region,
+                primitive_id=candidate.primitive_id,
+            )
+        return None
+
+
+@dataclass(frozen=True)
 class Scene:
     """Nearest-hit union of analytic solid primitives.
 
@@ -879,12 +1034,196 @@ class TrapezoidalLine:
         return math.hypot(point[0] - reference[0], point[1] - reference[1])
 
 
+@dataclass(frozen=True)
+class SuspendedTrapezoidalLine:
+    """A trapezoidal line on a free-standing membrane of finite thickness.
+
+    Same convention as :class:`TrapezoidalLine`: vacuum is toward negative
+    ``z``, the line top sits at ``substrate_z - height``, and the line is
+    infinite along ``y``.  The difference is that the support is a
+    :class:`Slab` of ``membrane_thickness`` rather than a semi-infinite
+    substrate, so vacuum also exists below ``substrate_z +
+    membrane_thickness`` and electrons can be transmitted.
+
+    ``total_thickness`` is the line top to membrane bottom distance, which is
+    the quantity usually quoted for a suspended line-and-space specimen.
+    """
+
+    top_width: float
+    bottom_width: float
+    height: float
+    membrane_thickness: float
+    center_x: float = 0.0
+    substrate_z: float = 0.0
+    surface_id: str = "suspended_line"
+    solid_region: str = SOLID_REGION
+    vacuum_region: str = VACUUM_REGION
+    position_epsilon: float = 1e-9
+    prism: TrapezoidalPrism = field(init=False, repr=False)
+    membrane: Slab = field(init=False, repr=False)
+    scene: Scene = field(init=False, repr=False)
+
+    def __post_init__(self):
+        membrane_thickness = float(self.membrane_thickness)
+        if not math.isfinite(membrane_thickness) or membrane_thickness <= 0.0:
+            raise ValueError("membrane_thickness must be finite and positive")
+        prism = TrapezoidalPrism(
+            top_width=self.top_width,
+            bottom_width=self.bottom_width,
+            height=self.height,
+            center_x=self.center_x,
+            substrate_z=self.substrate_z,
+            surface_id=self.surface_id,
+            solid_region=self.solid_region,
+            vacuum_region=self.vacuum_region,
+            boundary_tolerance=self.position_epsilon,
+        )
+        membrane = Slab(
+            top_z=prism.substrate_z,
+            thickness=membrane_thickness,
+            surface_id=f"{self.surface_id}.membrane",
+            solid_region=self.solid_region,
+            vacuum_region=self.vacuum_region,
+            boundary_tolerance=self.position_epsilon,
+        )
+        scene = Scene(
+            (membrane, prism),
+            solid_region=self.solid_region,
+            vacuum_region=self.vacuum_region,
+            position_epsilon=self.position_epsilon,
+        )
+        object.__setattr__(self, "top_width", prism.top_width)
+        object.__setattr__(self, "bottom_width", prism.bottom_width)
+        object.__setattr__(self, "height", prism.height)
+        object.__setattr__(self, "membrane_thickness", membrane_thickness)
+        object.__setattr__(self, "center_x", prism.center_x)
+        object.__setattr__(self, "substrate_z", prism.substrate_z)
+        object.__setattr__(self, "surface_id", prism.surface_id)
+        object.__setattr__(self, "solid_region", prism.solid_region)
+        object.__setattr__(self, "vacuum_region", prism.vacuum_region)
+        object.__setattr__(self, "position_epsilon", float(self.position_epsilon))
+        object.__setattr__(self, "prism", prism)
+        object.__setattr__(self, "membrane", membrane)
+        object.__setattr__(self, "scene", scene)
+
+    @property
+    def top_z(self):
+        return self.prism.top_z
+
+    @property
+    def bottom_z(self):
+        return self.membrane.bottom_z
+
+    @property
+    def total_thickness(self):
+        """Line top to membrane bottom."""
+        return self.height + self.membrane_thickness
+
+    @property
+    def point(self):
+        return (self.center_x, 0.0, self.top_z)
+
+    @property
+    def outward_normal(self):
+        return (0.0, 0.0, -1.0)
+
+    def region_at(self, point):
+        return self.scene.region_at(point)
+
+    def first_hit(self, origin, direction, max_distance, current_region):
+        return self.scene.first_hit(origin, direction, max_distance, current_region)
+
+    def surface_normal_at(self, point, incoming_direction=None):
+        return self.scene.surface_normal_at(point, incoming_direction)
+
+    def launch_surface(self, x, y=0.0, vacuum_direction=(0.0, 0.0, 1.0),
+                       clearance=None):
+        """Intersect a beam ray with the first exposed surface from vacuum.
+
+        Identical contract to :meth:`TrapezoidalLine.launch_surface`: the hit
+        is oriented vacuum-to-solid, so its ``normal`` points into the solid.
+        """
+        direction = _unit(vacuum_direction, "vacuum_direction")
+        if direction[2] <= self.scene.direction_epsilon:
+            raise ValueError("vacuum_direction must point toward increasing z")
+        if clearance is None:
+            clearance = max(
+                4.0 * self.height, self.bottom_width, self.top_width, 1.0
+            ) / direction[2]
+        clearance = float(clearance)
+        if not math.isfinite(clearance) or clearance <= 0.0:
+            raise ValueError("clearance must be finite and positive")
+        reference = (float(x), float(y), self.top_z)
+        origin = tuple(
+            reference[index] - clearance * direction[index]
+            for index in range(3)
+        )
+        if self.region_at(origin) != self.vacuum_region:
+            raise RuntimeError("computed beam origin is not in vacuum")
+        max_distance = clearance + (
+            self.height + self.membrane_thickness + self.bottom_width + 1.0
+        ) / direction[2]
+        hit = self.first_hit(origin, direction, max_distance, self.vacuum_region)
+        if hit is None:
+            raise RuntimeError("beam ray did not intersect the specimen")
+        return hit
+
+    def surface_point(self, x, y=0.0, vacuum_direction=(0.0, 0.0, 1.0)):
+        return self.launch_surface(x, y, vacuum_direction).position
+
+    def depth_into_solid(self, point):
+        """Depth below the nearest exposed surface, zero in vacuum.
+
+        Both the upper profile and the membrane underside are exposed, so the
+        depth is the smaller of the two.  Under the line the upper distance is
+        the shorter of going straight up through the line body and going
+        diagonally out to the exposed membrane top beside it; that corner term
+        is an approximation, adequate for the birth-depth diagnostics this
+        feeds and never used for transport.
+        """
+        point = _vec3(point, "point")
+        if self.region_at(point) != self.solid_region:
+            return 0.0
+        from_bottom = self.bottom_z - point[2]
+        x = abs(point[0] - self.center_x)
+        z = point[2] - self.substrate_z
+        if z < 0.0:
+            from_top = self.prism_depth(point)
+        elif x <= self.prism.half_bottom_width:
+            from_top = min(
+                z + self.height,
+                math.hypot(self.prism.half_bottom_width - x, z),
+            )
+        else:
+            from_top = z
+        return max(0.0, min(from_top, from_bottom))
+
+    def prism_depth(self, point):
+        """Perpendicular depth below the line's own top and sidewalls."""
+        point = _vec3(point, "point")
+        x = abs(point[0] - self.center_x)
+        z = point[2] - self.substrate_z
+        depth_top = z + self.height
+        slope = 0.5 * (self.bottom_width - self.top_width) / self.height
+        normal_norm = math.hypot(1.0, slope)
+        half_width_here = self.prism.half_bottom_width + slope * z
+        depth_side = (half_width_here - x) / normal_norm
+        return max(0.0, min(depth_top, depth_side))
+
+    def lateral_distance(self, point, reference):
+        point = _vec3(point, "point")
+        reference = _vec3(reference, "reference")
+        return math.hypot(point[0] - reference[0], point[1] - reference[1])
+
+
 __all__ = [
     "Geometry",
     "Plane",
     "Scene",
+    "Slab",
     "SOLID_REGION",
     "SurfaceHit",
+    "SuspendedTrapezoidalLine",
     "TrapezoidalLine",
     "TrapezoidalPrism",
     "VACUUM_REGION",

@@ -50,7 +50,57 @@ BASE_CHANNEL_DEFINITIONS = {
     "generation_2plus": "Emitted cascade electrons with generation >= 2.",
 }
 
-CAUSAL_LLE_CHANNEL_DEFINITIONS = {
+CAUSAL_LLE_V3_CHANNEL_DEFINITIONS = {
+    "se1": (
+        "causal_lle_v3: cascade emission, any final energy, created while the "
+        "classifying parent was directed into the configured reference "
+        "surface.  Aggregate of se1_lt50 and se1_ge50."
+    ),
+    "se2": (
+        "causal_lle_v3: cascade emission, any final energy, created while the "
+        "classifying parent was directed toward vacuum through the configured "
+        "reference surface.  Aggregate of se2_lt50 and se2_ge50."
+    ),
+    "se1_lt50": (
+        "causal_lle_v3: SE1 emitted below the configured energy cutoff."
+    ),
+    "se1_ge50": (
+        "causal_lle_v3: SE1 emitted at or above the configured energy cutoff."
+    ),
+    "se2_lt50": (
+        "causal_lle_v3: SE2 emitted below the configured energy cutoff."
+    ),
+    "se2_ge50": (
+        "causal_lle_v3: SE2 emitted at or above the configured energy cutoff."
+    ),
+    "lle_primary": (
+        "causal_lle_v3: emitted original incident electron with vacuum "
+        "energy loss below the configured LLE threshold."
+    ),
+    "non_lle_primary": (
+        "causal_lle_v3: emitted original incident electron with vacuum "
+        "energy loss at or above the configured LLE threshold."
+    ),
+    "first_event_backscatter": (
+        "Diagnostic: emitted original incident electron whose first completed "
+        "collision was an elastic event that turned it toward the launch "
+        "surface.  Scattering-history class; overlaps LLE and is not part of "
+        "the disjoint basis."
+    ),
+    "later_return_primary": (
+        "Diagnostic complement of first_event_backscatter: every other "
+        "emitted original incident electron, including those that never "
+        "entered the solid."
+    ),
+    "barrier_reflected_primary": (
+        "Diagnostic: emitted original incident electron reflected by the "
+        "surface barrier on entry.  It never entered the solid, so its vacuum "
+        "energy loss is exactly zero and it is an LLE for any positive "
+        "threshold.  Subset of lle_primary, not part of the disjoint basis."
+    ),
+}
+
+CAUSAL_LLE_V2_CHANNEL_DEFINITIONS = {
     "se1": (
         "causal_lle_v2: low-energy cascade emission created while its "
         "immediate energetic parent was directed into the configured "
@@ -80,6 +130,9 @@ CAUSAL_LLE_CHANNEL_DEFINITIONS = {
     ),
 }
 
+# Retained name for code written against the 0.7.x default.
+CAUSAL_LLE_CHANNEL_DEFINITIONS = CAUSAL_LLE_V2_CHANNEL_DEFINITIONS
+
 LEGACY_BRANCH_V1_CHANNEL_DEFINITIONS = {
     "se1": (
         "legacy branch_v1: low-energy cascade emission born before the "
@@ -98,12 +151,16 @@ LEGACY_BRANCH_V1_CHANNEL_DEFINITIONS = {
     ),
 }
 
-# Public defaults describe the current classifier.  The legacy constants remain
-# available through PopulationClassifier(definition="branch_v1") so archived
-# 0.6.1-era branch_v1 calculations can be reproduced exactly.
+# Public defaults describe the current classifier.  The older constants remain
+# available through PopulationClassifier(definition=...) so archived
+# causal_lle_v2 and 0.6.1-era branch_v1 calculations reproduce exactly.
 CHANNEL_DEFINITIONS = {
     **BASE_CHANNEL_DEFINITIONS,
-    **CAUSAL_LLE_CHANNEL_DEFINITIONS,
+    **CAUSAL_LLE_V3_CHANNEL_DEFINITIONS,
+}
+V2_CHANNEL_DEFINITIONS = {
+    **BASE_CHANNEL_DEFINITIONS,
+    **CAUSAL_LLE_V2_CHANNEL_DEFINITIONS,
 }
 LEGACY_CHANNEL_DEFINITIONS = {
     **BASE_CHANNEL_DEFINITIONS,
@@ -111,12 +168,29 @@ LEGACY_CHANNEL_DEFINITIONS = {
 }
 
 POPULATION_CHANNELS = tuple(CHANNEL_DEFINITIONS)
+V2_POPULATION_CHANNELS = tuple(V2_CHANNEL_DEFINITIONS)
 LEGACY_POPULATION_CHANNELS = tuple(LEGACY_CHANNEL_DEFINITIONS)
 
 # This basis partitions every emitted electron exactly once.  It is therefore
 # safe for covariance-aware joint fits, unlike overlapping collections such as
 # (TEY, SEY, BSE, SE1, SE2).
+#
+# The causal SE class and the detector energy cut are separate axes, so the
+# default basis crosses them rather than letting the 50 eV convention decide
+# which cascade electrons receive a causal label at all.  Aggregates follow:
+#   se1 = se1_lt50 + se1_ge50,  se2 = se2_lt50 + se2_ge50,
+#   se_cascade_lt50 = se1_lt50 + se2_lt50,
+#   fast_cascade_ge50 = se1_ge50 + se2_ge50.
 DISJOINT_POPULATION_CHANNELS = (
+    "se1_lt50",
+    "se1_ge50",
+    "se2_lt50",
+    "se2_ge50",
+    "lle_primary",
+    "non_lle_primary",
+)
+
+V2_DISJOINT_POPULATION_CHANNELS = (
     "se1",
     "se2",
     "fast_cascade_ge50",
@@ -131,6 +205,123 @@ LEGACY_DISJOINT_POPULATION_CHANNELS = (
     "bse1",
     "bse2",
 )
+
+# Absolute default LLE threshold.  It is numerically equal to the conventional
+# 50 eV SE/BSE emission cut, but the two are unrelated conventions: this one is
+# an energy *loss* window on emitted primaries, that one is an emitted-energy
+# cut.  They are stored separately in metadata and may be set independently.
+DEFAULT_LLE_MAX_LOSS_EV = 50.0
+
+CAUSAL_DEFINITIONS = ("causal_lle_v3", "causal_lle_v2")
+SE_PARENT_RULES = ("root_primary_leg", "immediate_parent")
+
+# Exit hemisphere is a third orthogonal axis, alongside the causal class and
+# the emitted-energy cut.  It only becomes observable on a geometry that has a
+# bottom exit surface -- a free-standing membrane -- where forward-going
+# electrons leave the specimen instead of being absorbed in a bulk substrate.
+TRANSMISSION_RINGS = ("bf", "adf", "haadf", "beyond_haadf")
+
+TRANSMISSION_CHANNEL_DEFINITIONS = {
+    "backward_all": (
+        "All emitted electrons leaving with a velocity component back along "
+        "the incident beam axis: the reflected (SEM) hemisphere."
+    ),
+    "forward_all": (
+        "All emitted electrons leaving with a velocity component along the "
+        "incident beam axis: the transmitted (STEM) hemisphere."
+    ),
+    "forward_primary_all": (
+        "Diagnostic: transmitted original incident electrons."
+    ),
+    "forward_cascade_all": (
+        "Diagnostic: transmitted cascade electrons, i.e. secondaries emitted "
+        "through the membrane underside."
+    ),
+    "fwd_bf": (
+        "Transmitted electron inside the bright-field collection angle, "
+        "measured as polar angle from the forward beam axis."
+    ),
+    "fwd_adf": (
+        "Transmitted electron in the annular dark-field ring."
+    ),
+    "fwd_haadf": (
+        "Transmitted electron in the high-angle annular dark-field ring."
+    ),
+    "fwd_beyond_haadf": (
+        "Transmitted electron scattered beyond the outer HAADF angle.  It "
+        "closes the forward partition and is not a physical detector."
+    ),
+    "fwd_bf_primary": (
+        "Diagnostic: original incident electrons within the bright-field "
+        "angle.  Comparing it with fwd_bf shows how much of the BF disc is "
+        "secondary-electron contamination."
+    ),
+    "fwd_adf_primary": (
+        "Diagnostic: original incident electrons in the ADF ring."
+    ),
+    "fwd_haadf_primary": (
+        "Diagnostic: original incident electrons in the HAADF ring."
+    ),
+}
+
+
+@dataclass(frozen=True)
+class TransmissionDetector:
+    """Angular segmentation of the transmitted (forward) hemisphere.
+
+    Ring boundaries are polar angles from the forward beam axis in
+    milliradians.  They are exclusive upper bounds, so ``bf`` is
+    ``theta < bf_max_mrad``.  ``beyond_haadf`` collects everything out to 90
+    degrees so that the four rings partition the forward hemisphere exactly.
+
+    These are collection angles, not a detector response: solid-angle
+    weighting, gain, and the finite BF-disc/detector-hole geometry of a real
+    STEM-in-SEM holder are forward-model steps applied afterwards.
+    """
+
+    bf_max_mrad: float = 10.0
+    adf_max_mrad: float = 50.0
+    haadf_max_mrad: float = 200.0
+
+    def __post_init__(self):
+        values = (
+            float(self.bf_max_mrad),
+            float(self.adf_max_mrad),
+            float(self.haadf_max_mrad),
+        )
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("transmission ring angles must be finite")
+        if not 0.0 < values[0] < values[1] < values[2]:
+            raise ValueError(
+                "transmission ring angles must satisfy "
+                "0 < bf_max_mrad < adf_max_mrad < haadf_max_mrad"
+            )
+        if values[2] > 0.5 * math.pi * 1000.0:
+            raise ValueError(
+                "haadf_max_mrad must not exceed 90 degrees (1570.8 mrad); "
+                "the forward hemisphere ends there"
+            )
+        object.__setattr__(self, "bf_max_mrad", values[0])
+        object.__setattr__(self, "adf_max_mrad", values[1])
+        object.__setattr__(self, "haadf_max_mrad", values[2])
+
+    def ring(self, theta_mrad):
+        """Ring name for one forward polar angle in milliradians."""
+        if theta_mrad < self.bf_max_mrad:
+            return "bf"
+        if theta_mrad < self.adf_max_mrad:
+            return "adf"
+        if theta_mrad < self.haadf_max_mrad:
+            return "haadf"
+        return "beyond_haadf"
+
+    def to_dict(self):
+        return {
+            "bf_max_mrad": self.bf_max_mrad,
+            "adf_max_mrad": self.adf_max_mrad,
+            "haadf_max_mrad": self.haadf_max_mrad,
+            "angle_reference": "polar_angle_from_forward_beam_axis",
+        }
 
 
 def _vec3(values, name):
@@ -198,61 +389,195 @@ def _pair(values, name, *, nonnegative=False):
 class PopulationClassifier:
     """Post-process one cascade into overlapping physical signal channels.
 
-    The default ``causal_lle_v2`` definition deliberately separates taxonomy
-    from expected spatial behavior and detector filtering:
+    The default ``causal_lle_v3`` definition deliberately separates causal
+    taxonomy, detector filtering, and image properties:
 
-    * SE1/SE2 are classified from the direction of the immediate energetic
-      parent at the creating collision, not from where the child was born;
-    * LLE/non-LLE is an explicit vacuum-energy-loss partition of emitted
-      original primaries;
-    * strict first-event BSE is retained as an overlapping diagnostic rather
-      than identified with LLE or used in the default fitting basis.
+    * SE1/SE2 are classified from the *direction* of the classifying parent at
+      the creating collision, relative to a declared reference surface normal.
+      No lateral distance, birth depth, energy loss, or resolution claim enters
+      the definition; localization is a consequence to be measured.
+    * The causal SE class is crossed with the emitted-energy cut instead of
+      being gated by it, so every cascade electron carries a causal label and
+      ``se1``/``se2`` mean the whole causal class at any final energy.
+    * ``se_parent_rule`` selects whose direction decides.  ``root_primary_leg``
+      (default) uses the root incident electron's own leg -- incoming versus
+      returning -- at the collision that seeded this electron's lineage, which
+      is the conventional literature meaning of SE1/SE2.  ``immediate_parent``
+      uses the immediate energetic parent, which may itself be a cascade
+      electron; that is a self-consistent generalization but a measurably
+      different population, so it is recorded in metadata either way.
+    * LLE/non-LLE is an explicit vacuum-energy-loss window on emitted original
+      primaries -- an experimentally realizable filter class, not a BSE
+      subspecies and not a scattering-history statement.
+    * Strict first-event backscatter and barrier-reflected primaries are kept
+      as overlapping diagnostics rather than identified with LLE or admitted to
+      the default fitting basis.
 
-    ``branch_v1`` reproduces the 0.6.1-era operational labels for legacy studies.
+    ``causal_lle_v2`` reproduces the 0.7.x default (SE classes gated at the
+    50 eV cut, immediate-parent rule).  ``branch_v1`` reproduces the 0.6.1-era
+    operational labels.  Both are retained so archived libraries refit exactly.
     """
 
     bse_cutoff_ev: float = 50.0
-    lle_max_loss_ev: float = 50.0
-    definition: str = "causal_lle_v2"
+    lle_max_loss_ev: Optional[float] = None
+    definition: str = "causal_lle_v3"
     se_reference: str = "launch_surface"
+    se_parent_rule: Optional[str] = None
+    lle_max_loss_frac: Optional[float] = None
+    transmission: Optional[TransmissionDetector] = None
 
     def __post_init__(self):
+        if self.transmission is not None:
+            if self.definition != "causal_lle_v3":
+                raise ValueError(
+                    "transmission channels require definition='causal_lle_v3'; "
+                    "the earlier definitions have no exit-hemisphere axis"
+                )
+            if not isinstance(self.transmission, TransmissionDetector):
+                raise TypeError(
+                    "transmission must be a TransmissionDetector or None"
+                )
         cutoff = float(self.bse_cutoff_ev)
         if not math.isfinite(cutoff) or cutoff < 0.0:
             raise ValueError("bse_cutoff_ev must be finite and non-negative")
-        lle_loss = float(self.lle_max_loss_ev)
-        if not math.isfinite(lle_loss) or lle_loss < 0.0:
-            raise ValueError("lle_max_loss_ev must be finite and non-negative")
-        if self.definition not in {"causal_lle_v2", "branch_v1"}:
+        if self.definition not in set(CAUSAL_DEFINITIONS) | {"branch_v1"}:
             raise ValueError(
-                "definition must be 'causal_lle_v2' or legacy 'branch_v1'"
+                "definition must be one of "
+                f"{CAUSAL_DEFINITIONS + ('branch_v1',)}"
             )
         if self.se_reference not in {"launch_surface", "escape_surface"}:
             raise ValueError(
                 "se_reference must be 'launch_surface' or 'escape_surface'"
             )
+
+        loss_ev = self.lle_max_loss_ev
+        loss_frac = self.lle_max_loss_frac
+        if self.definition == "branch_v1":
+            if loss_frac is not None:
+                raise ValueError(
+                    "branch_v1 has no LLE class; lle_max_loss_frac does not "
+                    "apply to it"
+                )
+            loss_ev = (
+                DEFAULT_LLE_MAX_LOSS_EV if loss_ev is None else float(loss_ev)
+            )
+        else:
+            if loss_ev is not None and loss_frac is not None:
+                raise ValueError(
+                    "give lle_max_loss_ev or lle_max_loss_frac, not both; the "
+                    "LLE threshold is either absolute or a fraction of E0"
+                )
+            if loss_ev is None and loss_frac is None:
+                loss_ev = DEFAULT_LLE_MAX_LOSS_EV
+        if loss_ev is not None:
+            loss_ev = float(loss_ev)
+            if not math.isfinite(loss_ev) or loss_ev < 0.0:
+                raise ValueError(
+                    "lle_max_loss_ev must be finite and non-negative"
+                )
+        if loss_frac is not None:
+            loss_frac = float(loss_frac)
+            if not math.isfinite(loss_frac) or not 0.0 <= loss_frac <= 1.0:
+                raise ValueError(
+                    "lle_max_loss_frac must be finite and within [0, 1]"
+                )
+
+        rule = self.se_parent_rule
+        if rule is None:
+            rule = (
+                "immediate_parent"
+                if self.definition == "causal_lle_v2"
+                else "root_primary_leg"
+            )
+        if rule not in SE_PARENT_RULES:
+            raise ValueError(f"se_parent_rule must be one of {SE_PARENT_RULES}")
+
         object.__setattr__(self, "bse_cutoff_ev", cutoff)
-        object.__setattr__(self, "lle_max_loss_ev", lle_loss)
+        object.__setattr__(self, "lle_max_loss_ev", loss_ev)
+        object.__setattr__(self, "lle_max_loss_frac", loss_frac)
+        object.__setattr__(self, "se_parent_rule", rule)
 
     @property
     def channels(self):
         if self.definition == "branch_v1":
             return LEGACY_POPULATION_CHANNELS
-        return POPULATION_CHANNELS
+        if self.definition == "causal_lle_v2":
+            return V2_POPULATION_CHANNELS
+        if self.transmission is None:
+            return POPULATION_CHANNELS
+        return POPULATION_CHANNELS + tuple(TRANSMISSION_CHANNEL_DEFINITIONS) + tuple(
+            f"back_{name}" for name in DISJOINT_POPULATION_CHANNELS
+        )
+
+    @property
+    def lle_criterion(self):
+        """``None`` for branch_v1, else which LLE threshold form is in use."""
+        if self.definition == "branch_v1":
+            return None
+        if self.lle_max_loss_frac is not None:
+            return "fractional_energy_loss"
+        return "absolute_energy_loss"
+
+    def lle_threshold_ev(self, incident_energy_ev):
+        """Absolute LLE threshold in eV for one landing energy."""
+        if self.lle_max_loss_frac is not None:
+            return float(self.lle_max_loss_frac) * float(incident_energy_ev)
+        return float(self.lle_max_loss_ev)
+
+    @property
+    def _threshold_text(self):
+        if self.lle_max_loss_frac is not None:
+            return f"{100.0 * self.lle_max_loss_frac:g}% of E0"
+        return f"{self.lle_max_loss_ev:g} eV"
 
     @property
     def definitions(self):
         if self.definition == "branch_v1":
             return dict(LEGACY_CHANNEL_DEFINITIONS)
-        definitions = dict(CHANNEL_DEFINITIONS)
-        threshold = f"{self.lle_max_loss_ev:g} eV"
+        definitions = dict(
+            V2_CHANNEL_DEFINITIONS
+            if self.definition == "causal_lle_v2"
+            else CHANNEL_DEFINITIONS
+        )
+        if self.transmission is not None:
+            definitions.update(TRANSMISSION_CHANNEL_DEFINITIONS)
+            rings = self.transmission
+            definitions["fwd_bf"] += f" Rule: theta < {rings.bf_max_mrad:g} mrad."
+            definitions["fwd_adf"] += (
+                f" Rule: {rings.bf_max_mrad:g} <= theta < "
+                f"{rings.adf_max_mrad:g} mrad."
+            )
+            definitions["fwd_haadf"] += (
+                f" Rule: {rings.adf_max_mrad:g} <= theta < "
+                f"{rings.haadf_max_mrad:g} mrad."
+            )
+            definitions["fwd_beyond_haadf"] += (
+                f" Rule: theta >= {rings.haadf_max_mrad:g} mrad."
+            )
+            for name in DISJOINT_POPULATION_CHANNELS:
+                definitions[f"back_{name}"] = (
+                    definitions[name] + " Restricted to the reflected "
+                    "hemisphere; the unprefixed name counts both hemispheres."
+                )
+        threshold = self._threshold_text
         reference = (
             "incident primary's launch surface"
             if self.se_reference == "launch_surface"
             else "emitted electron's actual escape surface"
         )
-        definitions["se1"] += f" Reference: {reference}."
-        definitions["se2"] += f" Reference: {reference}."
+        rule = (
+            "root incident electron's own leg at the collision that seeded "
+            "this lineage"
+            if self.se_parent_rule == "root_primary_leg"
+            else "immediate energetic parent's direction at the creating "
+                 "collision"
+        )
+        for name in ("se1", "se2", "se1_lt50", "se1_ge50",
+                     "se2_lt50", "se2_ge50"):
+            if name in definitions:
+                definitions[name] += (
+                    f" Reference: {reference}. Parent rule: {rule}."
+                )
         definitions["lle_primary"] += f" Rule: energy loss < {threshold}."
         definitions["non_lle_primary"] += (
             f" Rule: energy loss >= {threshold}."
@@ -263,25 +588,42 @@ class PopulationClassifier:
     def disjoint_channels(self):
         if self.definition == "branch_v1":
             return LEGACY_DISJOINT_POPULATION_CHANNELS
-        return DISJOINT_POPULATION_CHANNELS
+        if self.definition == "causal_lle_v2":
+            return V2_DISJOINT_POPULATION_CHANNELS
+        if self.transmission is None:
+            return DISJOINT_POPULATION_CHANNELS
+        # The backward hemisphere keeps the full causal taxonomy, because that
+        # is where the SE mechanism question lives; the forward hemisphere is
+        # segmented by collection angle, because that is what a STEM detector
+        # actually measures.  Together they still partition TEY exactly.
+        return tuple(
+            f"back_{name}" for name in DISJOINT_POPULATION_CHANNELS
+        ) + tuple(f"fwd_{ring}" for ring in TRANSMISSION_RINGS)
 
     def to_dict(self):
+        causal = self.definition in CAUSAL_DEFINITIONS
         return {
             "definition": self.definition,
             "bse_cutoff_ev": self.bse_cutoff_ev,
-            "lle_max_loss_ev": (
-                self.lle_max_loss_ev
-                if self.definition == "causal_lle_v2" else None
-            ),
+            "lle_criterion": self.lle_criterion,
+            "lle_max_loss_ev": self.lle_max_loss_ev if causal else None,
+            "lle_max_loss_frac": self.lle_max_loss_frac if causal else None,
             "se_reference": (
                 self.se_reference
-                if self.definition == "causal_lle_v2"
+                if causal
+                else "root_primary_first_surface_return_event"
+            ),
+            "se_parent_rule": (
+                self.se_parent_rule
+                if causal
                 else "root_primary_first_surface_return_event"
             ),
             "energy_reference": "vacuum",
             "lle_rule": (
-                "energy_loss_strictly_less_than_threshold"
-                if self.definition == "causal_lle_v2" else None
+                "energy_loss_strictly_less_than_threshold" if causal else None
+            ),
+            "transmission": (
+                None if self.transmission is None else self.transmission.to_dict()
             ),
         }
 
@@ -331,23 +673,102 @@ class PopulationClassifier:
             raise RuntimeError("energy-cut population channels do not partition TEY")
         if counts["tey"] != counts["cascade_all"] + counts["primary_all"]:
             raise RuntimeError("ancestry population channels do not partition TEY")
-        if counts["se_cascade_lt50"] != counts["se1"] + counts["se2"]:
-            raise RuntimeError("causal SE channels are incomplete")
+
+        # With a transmission detector the disjoint labels carry a hemisphere
+        # prefix, so the hemisphere-free aggregates and their invariants are
+        # deferred to _add_transmission_counts.
+        split_hemispheres = self.transmission is not None
+        if self.definition == "causal_lle_v3" and not split_hemispheres:
+            counts["se1"] = counts["se1_lt50"] + counts["se1_ge50"]
+            counts["se2"] = counts["se2_lt50"] + counts["se2_ge50"]
+            if counts["cascade_all"] != counts["se1"] + counts["se2"]:
+                raise RuntimeError(
+                    "causal SE channels do not cover every cascade emission"
+                )
+            if counts["se_cascade_lt50"] != (
+                    counts["se1_lt50"] + counts["se2_lt50"]):
+                raise RuntimeError(
+                    "sub-cutoff causal SE channels are incomplete"
+                )
+            if counts["fast_cascade_ge50"] != (
+                    counts["se1_ge50"] + counts["se2_ge50"]):
+                raise RuntimeError(
+                    "above-cutoff causal SE channels are incomplete"
+                )
+        elif self.definition != "causal_lle_v3":
+            if counts["se_cascade_lt50"] != counts["se1"] + counts["se2"]:
+                raise RuntimeError("causal SE channels are incomplete")
+
         if self.definition == "branch_v1":
             if counts["primary_all"] != counts["bse1"] + counts["bse2"]:
                 raise RuntimeError("legacy branch_v1 BSE channels are incomplete")
-        else:
-            if counts["primary_all"] != (
-                    counts["lle_primary"] + counts["non_lle_primary"]):
-                raise RuntimeError("LLE channels do not partition emitted primaries")
-            first_event, later_return = self._first_event_bse_counts(result)
+            return counts
+
+        if not split_hemispheres and counts["primary_all"] != (
+                counts["lle_primary"] + counts["non_lle_primary"]):
+            raise RuntimeError("LLE channels do not partition emitted primaries")
+        first_event, later_return = self._first_event_counts(result)
+        if counts["primary_all"] != first_event + later_return:
+            raise RuntimeError(
+                "first-event diagnostic channels do not partition primaries"
+            )
+        if self.definition == "causal_lle_v2":
             counts["first_event_bse"] = first_event
             counts["later_return_bse"] = later_return
-            if counts["primary_all"] != first_event + later_return:
-                raise RuntimeError(
-                    "first-event diagnostic channels do not partition primaries"
-                )
+            return counts
+
+        counts["first_event_backscatter"] = first_event
+        counts["later_return_primary"] = later_return
+        counts["barrier_reflected_primary"] = (
+            self._barrier_reflected_count(result)
+        )
+        if self.transmission is not None:
+            self._add_transmission_counts(result, counts)
         return counts
+
+    def _add_transmission_counts(self, result, counts):
+        """Fill the hemisphere aggregates and the angular diagnostics.
+
+        ``classify`` has already counted the disjoint ``back_*``/``fwd_*``
+        labels.  The hemisphere-free aggregates (``se1``, ``lle_primary`` and
+        friends) are recomputed here over both hemispheres, so those names keep
+        the meaning they have without a transmission detector.
+        """
+        classes = self._causal_classes(result)
+        hemispheres = self._exit_hemispheres(result)
+        cascade = {"se1_lt50", "se1_ge50", "se2_lt50", "se2_ge50"}
+        for emission in result.emissions:
+            electron_id = emission.electron_id
+            causal_class = classes[electron_id]
+            forward, ring = hemispheres[electron_id]
+            counts[causal_class] += 1
+            counts["forward_all" if forward else "backward_all"] += 1
+            if not forward:
+                continue
+            if causal_class in cascade:
+                counts["forward_cascade_all"] += 1
+            else:
+                counts["forward_primary_all"] += 1
+                if ring in ("bf", "adf", "haadf"):
+                    counts[f"fwd_{ring}_primary"] += 1
+
+        counts["se1"] = counts["se1_lt50"] + counts["se1_ge50"]
+        counts["se2"] = counts["se2_lt50"] + counts["se2_ge50"]
+
+        if counts["tey"] != counts["backward_all"] + counts["forward_all"]:
+            raise RuntimeError("exit hemispheres do not partition TEY")
+        if counts["cascade_all"] != counts["se1"] + counts["se2"]:
+            raise RuntimeError(
+                "causal SE channels do not cover every cascade emission"
+            )
+        if counts["primary_all"] != (
+                counts["lle_primary"] + counts["non_lle_primary"]):
+            raise RuntimeError("LLE channels do not partition emitted primaries")
+        forward_rings = sum(counts[f"fwd_{ring}"] for ring in TRANSMISSION_RINGS)
+        if counts["forward_all"] != forward_rings:
+            raise RuntimeError(
+                "transmission rings do not partition the forward hemisphere"
+            )
 
     def emission_labels(self, result: TrajectoryResult):
         """Return the disjoint population label for each emitted electron."""
@@ -372,21 +793,74 @@ class PopulationClassifier:
             raise ValueError("population classification expects one incident primary")
         return roots[0]
 
-    def _causal_lle_emission_labels(self, result):
+    def _se_parent_direction(self, records, electron_id):
+        """Direction whose sign against the reference normal decides SE1/SE2.
+
+        ``immediate_parent`` returns the immediate energetic parent's direction
+        just before the creating collision.  ``root_primary_leg`` walks the
+        ancestry up to the generation-1 ancestor and returns the *root incident
+        electron's* direction just before the collision that seeded this
+        lineage, so the class means "generated on the incoming leg" versus
+        "generated on the returning leg" of the beam electron itself.
+        """
+        record = records[electron_id]
+        if self.se_parent_rule == "immediate_parent":
+            direction = record.parent_direction_before
+            if direction is None:
+                raise ValueError(
+                    "causal SE classification requires the immediate parent "
+                    "direction at the birth collision"
+                )
+            return direction
+
+        seen = set()
+        while True:
+            parent_id = record.parent_id
+            if parent_id is None:
+                raise ValueError(
+                    "root-primary-leg SE classification expects a cascade "
+                    "electron with a recorded parent"
+                )
+            parent = records.get(parent_id)
+            if parent is None:
+                raise ValueError(
+                    "root-primary-leg SE classification requires the complete "
+                    "ancestry of every emitted cascade electron"
+                )
+            if parent.parent_id is None:
+                direction = record.parent_direction_before
+                if direction is None:
+                    raise ValueError(
+                        "causal SE classification requires the parent "
+                        "direction at the birth collision"
+                    )
+                return direction
+            if parent_id in seen:
+                raise ValueError("cyclic ancestry in trajectory history")
+            seen.add(parent_id)
+            record = parent
+
+    def _causal_classes(self, result):
+        """Hemisphere-free causal class for each emitted electron.
+
+        This is the classification proper.  Where the electron happens to
+        leave -- back toward the source or forward through the specimen -- is a
+        separate axis handled by :meth:`_exit_hemispheres`.
+        """
         history = result.history
         records = {record.electron_id: record for record in history.electrons}
         launch_normal = tuple(
             float(value) for value in history.reference_surface_normal
         )
-        labels = {}
+        threshold = self.lle_threshold_ev(history.incident_energy)
+        split_by_energy = self.definition == "causal_lle_v3"
+        classes = {}
         for emission in result.emissions:
-            if emission.is_cascade and emission.energy < self.bse_cutoff_ev:
-                record = records[emission.electron_id]
-                if record.parent_direction_before is None:
-                    raise ValueError(
-                        "causal SE classification requires the immediate parent "
-                        "direction at the birth collision"
-                    )
+            if emission.is_cascade:
+                fast = emission.energy >= self.bse_cutoff_ev
+                if fast and not split_by_energy:
+                    classes[emission.electron_id] = "fast_cascade_ge50"
+                    continue
                 normal = launch_normal
                 if self.se_reference == "escape_surface":
                     if emission.surface_normal is None:
@@ -395,22 +869,74 @@ class PopulationClassifier:
                             "emission surface normal"
                         )
                     normal = tuple(float(value) for value in emission.surface_normal)
-                parent_outward = _dot(record.parent_direction_before, normal) > 0.0
-                labels[emission.electron_id] = "se2" if parent_outward else "se1"
-            elif emission.is_cascade:
-                labels[emission.electron_id] = "fast_cascade_ge50"
+                direction = self._se_parent_direction(
+                    records, emission.electron_id
+                )
+                family = "se2" if _dot(direction, normal) > 0.0 else "se1"
+                classes[emission.electron_id] = (
+                    f"{family}_ge50" if fast else f"{family}_lt50"
+                ) if split_by_energy else family
             else:
                 energy_loss = max(
                     0.0, float(history.incident_energy) - float(emission.energy)
                 )
-                labels[emission.electron_id] = (
+                classes[emission.electron_id] = (
                     "lle_primary"
-                    if energy_loss < self.lle_max_loss_ev
+                    if energy_loss < threshold
                     else "non_lle_primary"
                 )
+        return classes
+
+    def _exit_hemispheres(self, result):
+        """Map each emission to ``(is_forward, ring_or_None)``.
+
+        Forward means the emitted velocity has a component along the incident
+        beam direction, so the electron left through the far side of the
+        specimen.  On a bulk substrate this set is empty; it becomes populated
+        only when the geometry has a bottom exit surface.
+        """
+        beam = tuple(float(value) for value in result.history.incident_direction)
+        detail = {}
+        for emission in result.emissions:
+            if emission.uvw is None:
+                raise ValueError(
+                    "transmission classification requires the emitted "
+                    "direction; use MCConfig(collect_spectra=True)"
+                )
+            projection = _dot(tuple(float(v) for v in emission.uvw), beam)
+            if projection <= 0.0:
+                detail[emission.electron_id] = (False, None)
+                continue
+            # Clamp guards against a projection a few ulps above one.
+            theta = math.acos(min(1.0, max(-1.0, projection)))
+            detail[emission.electron_id] = (
+                True, self.transmission.ring(theta * 1000.0)
+            )
+        return detail
+
+    def _causal_lle_emission_labels(self, result):
+        classes = self._causal_classes(result)
+        if self.transmission is None:
+            return classes
+        hemispheres = self._exit_hemispheres(result)
+        labels = {}
+        for electron_id, causal_class in classes.items():
+            forward, ring = hemispheres[electron_id]
+            labels[electron_id] = (
+                f"fwd_{ring}" if forward else f"back_{causal_class}"
+            )
         return labels
 
-    def _first_event_bse_counts(self, result):
+    @staticmethod
+    def _barrier_reflected_count(result):
+        """Emitted primaries turned back by the surface barrier on entry."""
+        return sum(
+            (not emission.is_cascade)
+            and emission.emission_mechanism == "incoming_barrier_reflection"
+            for emission in result.emissions
+        )
+
+    def _first_event_counts(self, result):
         history = result.history
         root = self._root_record(history)
         primary_count = sum(not emission.is_cascade for emission in result.emissions)
@@ -629,6 +1155,7 @@ def _geometry_metadata(geometry):
     metadata = {"type": type(geometry).__name__}
     for name in (
         "top_width", "bottom_width", "height", "center_x", "substrate_z",
+        "membrane_thickness", "total_thickness", "bottom_z",
         "surface_id", "solid_region", "vacuum_region",
     ):
         if hasattr(geometry, name):
@@ -1060,6 +1587,19 @@ class RasterDriver:
         if not sample.cfg.collect_spectra:
             raise ValueError(
                 "RasterDriver requires MCConfig(collect_spectra=True)"
+            )
+        # The material tables clamp any energy above their top grid point, so a
+        # landing energy outside the tabulated range would otherwise be
+        # simulated silently with cross sections taken from the table maximum.
+        if float(config.energy_ev) > float(sample.Emax):
+            warnings.warn(
+                f"landing energy {config.energy_ev:g} eV exceeds the "
+                f"{sample.name!r} table range "
+                f"[{sample.Emin:g}, {sample.Emax:g}] eV; cross sections are "
+                "clamped at the table maximum and the result is not "
+                "predictive at this energy",
+                RuntimeWarning,
+                stacklevel=2,
             )
         self.sample = sample
         self.geometry = geometry

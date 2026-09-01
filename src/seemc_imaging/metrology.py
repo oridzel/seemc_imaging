@@ -3,8 +3,8 @@
 The transport outputs many overlapping signals.  Formal joint fits should use
 mutually exclusive channels so that one emitted electron is not counted as two
 independent measurements.  The default basis is defined in ``raster.py`` and
-partitions TEY into causal SE1, causal SE2, fast cascade electrons, low-loss
-emitted primaries, and non-low-loss emitted primaries.
+partitions TEY into causal SE1 and SE2 -- each split by the emitted-energy cut
+-- plus low-loss and non-low-loss emitted primaries.
 """
 
 from __future__ import annotations
@@ -21,7 +21,9 @@ import numpy as np
 from .geometry import TrapezoidalLine
 from .raster import (
     DISJOINT_POPULATION_CHANNELS,
+    TRANSMISSION_RINGS,
     LEGACY_DISJOINT_POPULATION_CHANNELS,
+    V2_DISJOINT_POPULATION_CHANNELS,
     PopulationClassifier,
     RasterConfig,
     RasterDriver,
@@ -33,14 +35,61 @@ from .transport import Sample
 PARAMETER_NAMES = ("top_width", "bottom_width", "height")
 
 DEFAULT_CHANNEL_SETS = {
+    "se1": ("se1_lt50", "se1_ge50"),
+    "se2": ("se2_lt50", "se2_ge50"),
+    "se1_lt50": ("se1_lt50",),
+    "se2_lt50": ("se2_lt50",),
+    "lle_primary": ("lle_primary",),
+    "non_lle_primary": ("non_lle_primary",),
+    "low_energy_pair": ("se1_lt50", "se2_lt50"),
+    "causal_se_quartet": ("se1_lt50", "se1_ge50", "se2_lt50", "se2_ge50"),
+    "energy_loss_pair": ("lle_primary", "non_lle_primary"),
+    "primary_pair": ("lle_primary", "non_lle_primary"),
+    "energy_cut_pair": ("sey_50ev", "bse_50ev"),
+    "all_disjoint": DISJOINT_POPULATION_CHANNELS,
+    "causal_lle_v3": DISJOINT_POPULATION_CHANNELS,
+}
+
+TRANSMISSION_DISJOINT_POPULATION_CHANNELS = tuple(
+    f"back_{name}" for name in DISJOINT_POPULATION_CHANNELS
+) + tuple(f"fwd_{ring}" for ring in TRANSMISSION_RINGS)
+
+TRANSMISSION_CHANNEL_SETS = {
+    "se1": ("se1_lt50", "se1_ge50"),
+    "se2": ("se2_lt50", "se2_ge50"),
+    "lle_primary": ("lle_primary",),
+    "non_lle_primary": ("non_lle_primary",),
+    # Reflected (SEM) side.
+    "back_low_energy_pair": ("back_se1_lt50", "back_se2_lt50"),
+    "back_primary_pair": ("back_lle_primary", "back_non_lle_primary"),
+    "backward_causal": tuple(
+        f"back_{name}" for name in DISJOINT_POPULATION_CHANNELS
+    ),
+    # Transmitted (STEM) side.
+    "bf": ("fwd_bf",),
+    "adf": ("fwd_adf",),
+    "haadf": ("fwd_haadf",),
+    "stem_rings": ("fwd_bf", "fwd_adf", "fwd_haadf"),
+    "forward_rings": tuple(f"fwd_{ring}" for ring in TRANSMISSION_RINGS),
+    "bf_and_haadf": ("fwd_bf", "fwd_haadf"),
+    # Both sides.
+    "hemisphere_pair": ("backward_all", "forward_all"),
+    "energy_cut_pair": ("sey_50ev", "bse_50ev"),
+    "all_disjoint": TRANSMISSION_DISJOINT_POPULATION_CHANNELS,
+    "causal_lle_v3_transmission": TRANSMISSION_DISJOINT_POPULATION_CHANNELS,
+}
+
+V2_CHANNEL_SETS = {
     "se1": ("se1",),
     "se2": ("se2",),
     "lle_primary": ("lle_primary",),
     "non_lle_primary": ("non_lle_primary",),
     "low_energy_pair": ("se1", "se2"),
     "energy_loss_pair": ("lle_primary", "non_lle_primary"),
+    "primary_pair": ("lle_primary", "non_lle_primary"),
     "energy_cut_pair": ("sey_50ev", "bse_50ev"),
-    "all_disjoint": DISJOINT_POPULATION_CHANNELS,
+    "all_disjoint": V2_DISJOINT_POPULATION_CHANNELS,
+    "causal_lle_v2": V2_DISJOINT_POPULATION_CHANNELS,
 }
 
 V062_DISJOINT_POPULATION_CHANNELS = (
@@ -491,6 +540,17 @@ class ProfileFitter:
         return aliases.get(value, value)
 
     @staticmethod
+    def _default_se_parent_rule(definition):
+        """The parent rule an archive used when it recorded none.
+
+        Only ``causal_lle_v3`` ever wrote the field, so an archive without it
+        predates the option and used the immediate-parent rule.
+        """
+        if definition in (None, "branch_v1"):
+            return None
+        return "immediate_parent"
+
+    @staticmethod
     def _classifier_config(metadata, channels):
         config = metadata.get("classifier_config")
         if isinstance(config, Mapping):
@@ -498,24 +558,39 @@ class ProfileFitter:
             config["se_reference"] = ProfileFitter._canonical_se_reference(
                 config.get("se_reference")
             )
+            config.setdefault("se_parent_rule", None)
+            if config["se_parent_rule"] is None:
+                config["se_parent_rule"] = ProfileFitter._default_se_parent_rule(
+                    config.get("definition")
+                )
+            config.setdefault("lle_max_loss_frac", None)
             return config
         definition = metadata.get("classifier")
+        channel_set = set(channels)
         if definition is None:
-            channel_set = set(channels)
             if {"bse1", "bse2"}.issubset(channel_set):
                 definition = "branch_v1"
+            elif {"fwd_bf", "back_se1_lt50"}.issubset(channel_set):
+                definition = "causal_lle_v3"
+            elif {"se1_lt50", "se2_lt50"}.issubset(channel_set):
+                definition = "causal_lle_v3"
             elif {"lle_primary", "non_lle_primary"}.issubset(channel_set):
                 definition = "causal_lle_v2"
             elif {"lle_bse", "non_lle_bse"}.issubset(channel_set):
                 definition = "causal_lle_v2"
         if definition is None:
             return {}
-        is_v062 = {"lle_bse", "non_lle_bse"}.issubset(set(channels))
+        is_v062 = {"lle_bse", "non_lle_bse"}.issubset(channel_set)
         config = {
             "definition": definition,
             "bse_cutoff_ev": metadata.get("bse_cutoff_ev"),
             "lle_max_loss_ev": metadata.get(
                 "lle_max_loss_ev", metadata.get("low_loss_max_ev")
+            ),
+            "lle_max_loss_frac": metadata.get("lle_max_loss_frac"),
+            "se_parent_rule": (
+                metadata.get("se_parent_rule")
+                or ProfileFitter._default_se_parent_rule(definition)
             ),
             "se_reference": (
                 metadata.get("se_reference")
@@ -580,18 +655,25 @@ class ProfileFitter:
                 f"library={first_definition!r}, observation={second_definition!r}"
             )
         if first_definition == second_definition:
-            first_reference = library_classifier.get("se_reference")
-            second_reference = observation_classifier.get("se_reference")
-            if (first_reference is not None and second_reference is not None
-                    and first_reference != second_reference):
-                issues.append(
-                    "SE reference mismatch: "
-                    f"library={first_reference!r}, "
-                    f"observation={second_reference!r}"
-                )
+            for key, label in (
+                ("se_reference", "SE reference"),
+                ("se_parent_rule", "SE parent rule"),
+                ("lle_criterion", "LLE criterion"),
+                ("transmission", "transmission detector"),
+            ):
+                first_value = library_classifier.get(key)
+                second_value = observation_classifier.get(key)
+                if (first_value is not None and second_value is not None
+                        and first_value != second_value):
+                    issues.append(
+                        f"{label} mismatch: "
+                        f"library={first_value!r}, "
+                        f"observation={second_value!r}"
+                    )
             for key, label in (
                 ("bse_cutoff_ev", "SE/BSE cutoff"),
                 ("lle_max_loss_ev", "LLE maximum loss"),
+                ("lle_max_loss_frac", "LLE maximum loss fraction"),
             ):
                 first = library_classifier.get(key)
                 second = observation_classifier.get(key)
@@ -860,8 +942,15 @@ def compare_channel_information(
     ], axis=-1)  # (channel, x, estimable parameter)
     if channel_sets is None:
         available = set(library.channels)
-        if set(DISJOINT_POPULATION_CHANNELS).issubset(available):
+        # Order matters: a causal_lle_v3 library also contains every
+        # causal_lle_v2 channel name, so the more specific basis is tested
+        # first and the v2 basis only matches a genuinely v2 archive.
+        if set(TRANSMISSION_DISJOINT_POPULATION_CHANNELS).issubset(available):
+            channel_sets = TRANSMISSION_CHANNEL_SETS
+        elif set(DISJOINT_POPULATION_CHANNELS).issubset(available):
             channel_sets = DEFAULT_CHANNEL_SETS
+        elif set(V2_DISJOINT_POPULATION_CHANNELS).issubset(available):
+            channel_sets = V2_CHANNEL_SETS
         elif set(V062_DISJOINT_POPULATION_CHANNELS).issubset(available):
             channel_sets = V062_CHANNEL_SETS
         elif set(LEGACY_DISJOINT_POPULATION_CHANNELS).issubset(available):
@@ -940,6 +1029,9 @@ def compare_channel_information(
 __all__ = [
     "DEFAULT_CHANNEL_SETS",
     "LEGACY_CHANNEL_SETS",
+    "TRANSMISSION_CHANNEL_SETS",
+    "TRANSMISSION_DISJOINT_POPULATION_CHANNELS",
+    "V2_CHANNEL_SETS",
     "V062_CHANNEL_SETS",
     "V062_DISJOINT_POPULATION_CHANNELS",
     "InformationResult",

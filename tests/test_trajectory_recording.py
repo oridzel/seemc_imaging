@@ -110,7 +110,7 @@ def test_recording_is_opt_in_rng_transparent_and_round_trips(tmp_path):
     assert np.all(np.diff(archive.cascade_electron_offsets) >= 1)
     assert np.all(np.diff(archive.electron_point_offsets) >= 1)
     assert set(archive.electron_population).issubset({
-        "se1", "se2", "fast_cascade_ge50",
+        "se1_lt50", "se1_ge50", "se2_lt50", "se2_ge50",
         "lle_primary", "non_lle_primary",
         "cascade_absorbed", "primary_absorbed",
     })

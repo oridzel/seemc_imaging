@@ -16,6 +16,10 @@ _C_ANGSTROM_PER_FS = 2_997.92458
 POPULATION_COLORS = {
     "se1": "#39d98a",
     "se2": "#f9c74f",
+    "se1_lt50": "#39d98a",
+    "se1_ge50": "#1f9d63",
+    "se2_lt50": "#f9c74f",
+    "se2_ge50": "#f9844a",
     "fast_cascade_ge50": "#f9844a",
     "lle_primary": "#43aaef",
     "non_lle_primary": "#c77dff",
@@ -25,29 +29,79 @@ POPULATION_COLORS = {
     "bse2": "#c77dff",
     "cascade_absorbed": "#98a2b3",
     "primary_absorbed": "#e5e7eb",
+    # Reflected hemisphere keeps the causal colours.
+    "back_se1_lt50": "#39d98a",
+    "back_se1_ge50": "#1f9d63",
+    "back_se2_lt50": "#f9c74f",
+    "back_se2_ge50": "#f9844a",
+    "back_lle_primary": "#43aaef",
+    "back_non_lle_primary": "#c77dff",
+    # Transmitted hemisphere: a cool ramp from the BF disc outwards.
+    "fwd_bf": "#e0f2fe",
+    "fwd_adf": "#7dd3fc",
+    "fwd_haadf": "#0ea5e9",
+    "fwd_beyond_haadf": "#1e3a8a",
 }
 
+# Emitted primaries are labelled "primary", not "BSE".  The non-LLE class is
+# the complement of LLE among *all* emitted original incident electrons, so it
+# also holds primaries emitted below the 50 eV cut, which the conventional
+# partition counts as SEs rather than BSEs.
 PROFILE_STYLES = {
     "tey": ("TEY", "#f8fafc"),
     "sey_50ev": ("SE, E < 50 eV", "#39d98a"),
     "bse_50ev": ("BSE, E ≥ 50 eV", "#43aaef"),
-    "se1": ("SE1", "#39d98a"),
-    "se2": ("SE2", "#f9c74f"),
+    "se1": ("SE1 (all E)", "#39d98a"),
+    "se2": ("SE2 (all E)", "#f9c74f"),
+    "se1_lt50": ("SE1, E < 50 eV", "#39d98a"),
+    "se1_ge50": ("SE1, E ≥ 50 eV", "#1f9d63"),
+    "se2_lt50": ("SE2, E < 50 eV", "#f9c74f"),
+    "se2_ge50": ("SE2, E ≥ 50 eV", "#f9844a"),
     "fast_cascade_ge50": ("Fast cascade", "#f9844a"),
-    "lle_primary": ("Low-loss BSE", "#43aaef"),
-    "non_lle_primary": ("Non-LLE BSE", "#c77dff"),
-    "lle_bse": ("Low-loss BSE", "#43aaef"),
-    "non_lle_bse": ("Non-LLE BSE", "#c77dff"),
+    "lle_primary": ("Low-loss primary", "#43aaef"),
+    "non_lle_primary": ("Non-LLE primary", "#c77dff"),
+    "first_event_backscatter": ("First-event backscatter", "#7dd3fc"),
+    "later_return_primary": ("Later-return primary", "#c77dff"),
+    "barrier_reflected_primary": ("Barrier-reflected primary", "#94a3b8"),
+    "lle_bse": ("Low-loss primary", "#43aaef"),
+    "non_lle_bse": ("Non-LLE primary", "#c77dff"),
     "bse1": ("BSE1", "#43aaef"),
     "bse2": ("BSE2", "#c77dff"),
+    "backward_all": ("Reflected (all)", "#39d98a"),
+    "forward_all": ("Transmitted (all)", "#0ea5e9"),
+    "forward_primary_all": ("Transmitted primaries", "#0369a1"),
+    "forward_cascade_all": ("Transmitted SE", "#7dd3fc"),
+    "back_se1_lt50": ("SE1, E < 50 eV (refl.)", "#39d98a"),
+    "back_se1_ge50": ("SE1, E \u2265 50 eV (refl.)", "#1f9d63"),
+    "back_se2_lt50": ("SE2, E < 50 eV (refl.)", "#f9c74f"),
+    "back_se2_ge50": ("SE2, E \u2265 50 eV (refl.)", "#f9844a"),
+    "back_lle_primary": ("Low-loss primary (refl.)", "#43aaef"),
+    "back_non_lle_primary": ("Non-LLE primary (refl.)", "#c77dff"),
+    "fwd_bf": ("BF", "#e0f2fe"),
+    "fwd_adf": ("ADF", "#7dd3fc"),
+    "fwd_haadf": ("HAADF", "#0ea5e9"),
+    "fwd_beyond_haadf": ("Beyond HAADF", "#1e3a8a"),
+    "fwd_bf_primary": ("BF primaries", "#0369a1"),
+    "fwd_adf_primary": ("ADF primaries", "#0284c7"),
+    "fwd_haadf_primary": ("HAADF primaries", "#075985"),
 }
 
 PROFILE_PRESETS = {
     "populations": ("se1", "se2", "lle_primary", "non_lle_primary"),
+    "populations_disjoint": (
+        "se1_lt50", "se1_ge50", "se2_lt50", "se2_ge50",
+        "lle_primary", "non_lle_primary",
+    ),
     "v062_populations": ("se1", "se2", "lle_bse", "non_lle_bse"),
     "legacy_populations": ("se1", "se2", "bse1", "bse2"),
     "conventional": ("sey_50ev", "bse_50ev"),
     "tey_se_bse": ("tey", "sey_50ev", "bse_50ev"),
+    "stem": ("fwd_bf", "fwd_adf", "fwd_haadf", "fwd_beyond_haadf"),
+    "stem_rings": ("fwd_bf", "fwd_adf", "fwd_haadf"),
+    "hemispheres": ("backward_all", "forward_all"),
+    "se_and_stem": (
+        "se1", "se2", "fwd_bf", "fwd_adf", "fwd_haadf",
+    ),
 }
 
 
@@ -86,17 +140,27 @@ def _display_track(archive, electron_index, vacuum_flight_nm):
     return points
 
 
+_ANIMATABLE_GEOMETRIES = ("TrapezoidalLine", "SuspendedTrapezoidalLine")
+
+
 def _geometry_values(archive):
     geometry = archive.metadata.get("geometry", {})
-    if geometry.get("type") != "TrapezoidalLine":
+    if geometry.get("type") not in _ANIMATABLE_GEOMETRIES:
         raise ValueError(
-            "trapezoidal scan animation requires TrapezoidalLine metadata"
+            "trapezoidal scan animation requires one of "
+            f"{_ANIMATABLE_GEOMETRIES} in the archive geometry metadata"
         )
     required = ("top_width", "bottom_width", "height", "center_x", "substrate_z")
     missing = [name for name in required if name not in geometry]
     if missing:
         raise ValueError(f"trajectory archive is missing geometry values: {missing}")
-    return {name: float(geometry[name]) / 10.0 for name in required}
+    values = {name: float(geometry[name]) / 10.0 for name in required}
+    # A suspended membrane has a finite underside; a bulk substrate does not.
+    thickness = geometry.get("membrane_thickness")
+    values["membrane_thickness"] = (
+        None if thickness is None else float(thickness) / 10.0
+    )
+    return values
 
 
 def _trapezoid_surface_height_nm(
@@ -235,20 +299,34 @@ def animate_trapezoidal_scan(
         for spine in current_axis.spines.values():
             spine.set_color("#344054")
 
+    membrane_thickness = geometry.get("membrane_thickness")
     x_margin = max(0.08 * (x_nm[-1] - x_nm[0]), 8.0)
     axis.set_xlim(x_nm[0] - x_margin, x_nm[-1] + x_margin)
-    axis.set_ylim(-max(0.35 * height, 12.0), height + vacuum_flight_nm)
-    axis.set_ylabel("Height above substrate (nm)", color="#e5e7eb")
+    if membrane_thickness is None:
+        lower_limit = -max(0.35 * height, 12.0)
+    else:
+        # Leave room below the membrane so transmitted tracks stay visible.
+        lower_limit = -(membrane_thickness + max(0.5 * vacuum_flight_nm, 10.0))
+    axis.set_ylim(lower_limit, height + vacuum_flight_nm)
+    axis.set_ylabel("Height above line base (nm)", color="#e5e7eb")
     axis.tick_params(labelbottom=False)
     axis.grid(color="#334155", alpha=0.18, linewidth=0.7)
 
-    substrate = Rectangle(
-        (x_nm[0] - 2.0 * x_margin, axis.get_ylim()[0]),
-        x_nm[-1] - x_nm[0] + 4.0 * x_margin,
-        substrate_height - axis.get_ylim()[0],
-        facecolor="#263548", edgecolor="none", zorder=0,
-    )
-    axis.add_patch(substrate)
+    if membrane_thickness is None:
+        support = Rectangle(
+            (x_nm[0] - 2.0 * x_margin, axis.get_ylim()[0]),
+            x_nm[-1] - x_nm[0] + 4.0 * x_margin,
+            substrate_height - axis.get_ylim()[0],
+            facecolor="#263548", edgecolor="none", zorder=0,
+        )
+    else:
+        support = Rectangle(
+            (x_nm[0] - 2.0 * x_margin, substrate_height - membrane_thickness),
+            x_nm[-1] - x_nm[0] + 4.0 * x_margin,
+            membrane_thickness,
+            facecolor="#263548", edgecolor="#9fb3c8", linewidth=1.0, zorder=0,
+        )
+    axis.add_patch(support)
     trapezoid = Polygon(
         [
             (center_x - bottom_width / 2.0, substrate_height),

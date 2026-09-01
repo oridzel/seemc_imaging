@@ -11,29 +11,64 @@ from seemc_imaging.transport import Electron, barrier_transmission
 from synthetic_material import write_synthetic_database
 
 
-# Generated once from the untouched validated optlib SEEMC snapshot.  These
-# values protect the fork boundary independently of the history-on/off test.
-GOLDEN = {
+# PROVENANCE.
+#
+# The original snapshot below was generated from the untouched validated optlib
+# SEEMC snapshot, before the incoming-barrier transmission step existed.  That
+# change made the vacuum->solid barrier a sampled event instead of an implicit
+# transmission probability of one, which both alters the physics and shifts
+# every downstream RNG draw: seed 42 now diverges from its first step (4/2
+# collisions then, 133/281 now).  The old values therefore cannot be met by any
+# version of the current transport and are retained only as a record of what
+# the fork boundary looked like before that fix.
+#
+# GOLDEN below was regenerated against seemc_imaging 0.7.4 with numpy 2.4.4 and
+# CPython 3.11.  Regenerate it deliberately, never to make a red test pass: a
+# diff here means either an intended transport change (record it in this
+# comment) or a real regression.
+PRE_BARRIER_TRANSMISSION_GOLDEN = {
     3: {
         "counts": (3, 2, 1, 2, 1),
-        "emissions": (
-            (368.9280357680037, 0.9517129429983894, False, 0, 0.0),
-            (9.168774687285868, 0.9686899766495718, True, 1,
-             24.366214545787077),
-            (5.234409825684892, 0.8224049553725881, True, 2,
-             17.44705108092834),
-        ),
         "diagnostics": {
             "inelastic_events": 26,
             "elastic_events": 46,
             "surface_encounters": 3,
             "escapes": 3,
-            "internal_reflections": 0,
             "se_created": 14,
+        },
+    },
+    42: {
+        "counts": (1, 0, 1, 0, 1),
+        "diagnostics": {
+            "inelastic_events": 4,
+            "elastic_events": 2,
+            "surface_encounters": 1,
+            "escapes": 1,
+            "se_created": 2,
+        },
+    },
+}
+
+GOLDEN = {
+    3: {
+        "counts": (1, 0, 1, 0, 1),
+        "emissions": (
+            (402.10451508748577, 0.5267744311071673, False, 0, 0.0),
+        ),
+        "diagnostics": {
+            "inelastic_events": 26,
+            "elastic_events": 46,
+            "surface_encounters": 2,
+            "escapes": 1,
+            "internal_reflections": 1,
+            "incoming_barrier_encounters": 1,
+            "incoming_barrier_reflections": 0,
+            "incoming_barrier_transmissions": 1,
+            "se_created": 11,
             "se_blocked_pauli": 0,
             "se_pauli_fallback": 0,
             "channel_reclassified": 12,
-            "se_below_barrier": 12,
+            "se_below_barrier": 15,
             "omega_cdf_empty": 0,
             "q_window_clipped": 0,
             "q_cdf_empty": 0,
@@ -42,21 +77,25 @@ GOLDEN = {
         },
     },
     42: {
-        "counts": (1, 0, 1, 0, 1),
+        "counts": (1, 1, 0, 1, 0),
         "emissions": (
-            (481.6954315647352, 0.32149067988713553, False, 0, 0.0),
+            (3.419013842609088, 0.8803296665367016, True, 1,
+             9.925218427135981),
         ),
         "diagnostics": {
-            "inelastic_events": 4,
-            "elastic_events": 2,
-            "surface_encounters": 1,
+            "inelastic_events": 133,
+            "elastic_events": 281,
+            "surface_encounters": 4,
             "escapes": 1,
-            "internal_reflections": 0,
-            "se_created": 2,
+            "internal_reflections": 3,
+            "incoming_barrier_encounters": 1,
+            "incoming_barrier_reflections": 0,
+            "incoming_barrier_transmissions": 1,
+            "se_created": 67,
             "se_blocked_pauli": 0,
             "se_pauli_fallback": 0,
-            "channel_reclassified": 2,
-            "se_below_barrier": 2,
+            "channel_reclassified": 51,
+            "se_below_barrier": 66,
             "omega_cdf_empty": 0,
             "q_window_clipped": 0,
             "q_cdf_empty": 0,

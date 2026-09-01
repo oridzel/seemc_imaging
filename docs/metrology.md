@@ -66,25 +66,27 @@ metrology.
 
 The default joint basis is:
 
-1. `se1`
-2. `se2`
-3. `fast_cascade_ge50`
-4. `lle_primary`
-5. `non_lle_primary`
+1. `se1_lt50`
+2. `se1_ge50`
+3. `se2_lt50`
+4. `se2_ge50`
+5. `lle_primary`
+6. `non_lle_primary`
 
 These categories are mutually exclusive and partition TEY. The signal
-concepts are explicitly operational: SE1/SE2 use the immediate parent's
-direction at creation, while LLE/non-LLE use a configured vacuum energy-loss
-threshold. The fit does not assume that any class is intrinsically localized
-or high resolution.
+concepts are explicitly operational: SE1/SE2 use a parent direction at
+creation, selected by `se_parent_rule`, while LLE/non-LLE use a configured
+vacuum energy-loss threshold, absolute or fractional. The fit does not assume
+that any class is intrinsically localized or high resolution.
 
-The information report also compares individual channels, the SE1/SE2 pair,
-the LLE/non-LLE pair, the conventional energy-cut SE/BSE pair, and all five
-disjoint populations.
+The information report also compares individual channels, the sub-cutoff
+SE1/SE2 pair, the full causal SE quartet, the LLE/non-LLE pair, the
+conventional energy-cut SE/BSE pair, and all six disjoint populations.
 
-Legacy 0.6.1-era model libraries retain their `branch_v1` five-channel basis,
-while 0.6.2 libraries retain their `lle_bse`/`non_lle_bse` basis. Both can still
-be fitted. The CLI resolves `--channels all_disjoint` to the basis actually
+0.7.x `causal_lle_v2` libraries retain their energy-gated five-channel basis,
+legacy 0.6.1-era model libraries their `branch_v1` five-channel basis, and
+0.6.2 libraries their `lle_bse`/`non_lle_bse` basis. All can still be
+fitted. The CLI resolves `--channels all_disjoint` to the basis actually
 stored in the library.
 
 ## Local information estimate
@@ -102,7 +104,7 @@ the reported geometry covariance is marginalized over them. The square roots
 of its diagonal are local Cramér--Rao bounds, not a complete measurement
 uncertainty budget. They depend on the simulated material, beam energy, spot,
 primary count, grid spacing, detector assumptions, and accuracy of the
-`causal_lle_v2` population model.
+`causal_lle_v3` population model.
 
 At least two grid values are required along each parameter at the reference
 geometry. Three values are preferable because they provide central finite

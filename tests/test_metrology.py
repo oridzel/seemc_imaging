@@ -18,7 +18,8 @@ from seemc_imaging import (
 from synthetic_material import write_synthetic_database
 
 
-def _analytic_library():
+def _analytic_library(channels=DISJOINT_POPULATION_CHANNELS):
+    channels = tuple(channels)
     x = np.linspace(-500.0, 500.0, 101)
     points = np.asarray([
         (top, bottom, height)
@@ -37,26 +38,31 @@ def _analytic_library():
         )
         inner_peak = np.exp(-((np.abs(x) - inner) / 12.0) ** 2)
         outer_peak = np.exp(-((np.abs(x) - outer) / 15.0) ** 2)
-        profiles.append(np.stack([
+        # Six synthetic shapes, sliced to however many channels the caller
+        # asked for, so the same helper serves the causal_lle_v3 basis and the
+        # shorter historical bases.
+        shapes = [
             0.12 + 0.15 * inner_peak + 0.003 * angle_factor * sidewall,
+            0.010 + 0.004 * inner_peak,
             0.70 + 0.25 * sidewall + 0.04 * inner_peak,
             0.025 + 0.01 * sidewall,
             0.18 + 0.22 * outer_peak + 0.02 * sidewall,
             0.32 + 0.18 * sidewall + 0.03 * outer_peak,
-        ]))
+        ]
+        profiles.append(np.stack(shapes[:len(channels)]))
     yields = np.stack(profiles)
     n_models, n_channels, n_x = yields.shape
     covariance = np.zeros((n_models, n_x, n_channels, n_channels))
     diagonal = np.arange(n_channels)
     covariance[:, :, diagonal, diagonal] = np.asarray(
-        [2e-5, 5e-5, 1e-5, 3e-5, 4e-5]
-    )
+        [2e-5, 8e-6, 5e-5, 1e-5, 3e-5, 4e-5]
+    )[:n_channels]
     covariance[:, :, 0, 1] = covariance[:, :, 1, 0] = 6e-6
     completed = np.full((n_models, n_x), 5000, dtype=np.int64)
     return TrapezoidModelLibrary(
         points,
         x,
-        DISJOINT_POPULATION_CHANNELS,
+        channels,
         yields,
         covariance,
         completed,
@@ -104,7 +110,7 @@ def test_information_comparison_uses_joint_covariance():
         library,
         reference_parameters=(500.0, 700.0, 500.0),
         channel_sets={
-            "se_pair": ("se1", "se2"),
+            "se_pair": ("se1_lt50", "se2_lt50"),
             "all": DISJOINT_POPULATION_CHANNELS,
         },
         fit_scale=True,
@@ -137,9 +143,11 @@ def test_small_transport_sweep_round_trip(tmp_path):
     library = TrapezoidSweepDriver(sample, raster, sweep).run(progress=False)
 
     assert library.parameters.shape == (2, 3)
-    assert library.yields.shape == (2, 17, 3)
-    assert library.covariance_of_mean.shape == (2, 3, 17, 17)
-    assert library.metadata["classifier_config"]["definition"] == "causal_lle_v2"
+    assert library.yields.shape == (2, 22, 3)
+    assert library.covariance_of_mean.shape == (2, 3, 22, 22)
+    config = library.metadata["classifier_config"]
+    assert config["definition"] == "causal_lle_v3"
+    assert config["se_parent_rule"] == "root_primary_leg"
     path = library.save_npz(tmp_path / "library.npz")
     loaded = TrapezoidModelLibrary.from_npz(path)
     assert np.array_equal(loaded.parameters, library.parameters)
@@ -305,7 +313,7 @@ def test_fit_accepts_legacy_launch_surface_description():
 
 
 def test_v062_library_is_recognized_with_escape_surface_metadata():
-    original = _analytic_library()
+    original = _analytic_library(V062_DISJOINT_POPULATION_CHANNELS)
     metadata = {
         **original.metadata,
         "classifier": "causal_lle_v2",
