@@ -228,7 +228,14 @@ TRANSMISSION_CHANNEL_DEFINITIONS = {
     ),
     "forward_all": (
         "All emitted electrons leaving with a velocity component along the "
-        "incident beam axis: the transmitted (STEM) hemisphere."
+        "incident beam axis.  On a topographic specimen this is NOT the same "
+        "as transmitted: see fwd_lateral_escape."
+    ),
+    "transmitted_all": (
+        "Emitted electrons that both travel forward and left through a "
+        "surface facing away from the source, i.e. actually crossed the "
+        "specimen.  Equals the sum of the angular rings.  This, not "
+        "forward_all, is the STEM signal."
     ),
     "forward_primary_all": (
         "Diagnostic: transmitted original incident electrons."
@@ -250,6 +257,13 @@ TRANSMISSION_CHANNEL_DEFINITIONS = {
     "fwd_beyond_haadf": (
         "Transmitted electron scattered beyond the outer HAADF angle.  It "
         "closes the forward partition and is not a physical detector."
+    ),
+    "fwd_lateral_escape": (
+        "Forward-going electron that left through a surface facing the source "
+        "or parallel to the beam -- a sidewall or the top face -- rather than "
+        "through the far side.  It never crossed the specimen, so it is not "
+        "transmitted; on a topographic specimen at low kV this is most of the "
+        "forward hemisphere."
     ),
     "fwd_bf_primary": (
         "Diagnostic: original incident electrons within the bright-field "
@@ -598,7 +612,9 @@ class PopulationClassifier:
         # actually measures.  Together they still partition TEY exactly.
         return tuple(
             f"back_{name}" for name in DISJOINT_POPULATION_CHANNELS
-        ) + tuple(f"fwd_{ring}" for ring in TRANSMISSION_RINGS)
+        ) + tuple(f"fwd_{ring}" for ring in TRANSMISSION_RINGS) + (
+            "fwd_lateral_escape",
+        )
 
     def to_dict(self):
         causal = self.definition in CAUSAL_DEFINITIONS
@@ -751,6 +767,8 @@ class PopulationClassifier:
                 counts["forward_primary_all"] += 1
                 if ring in ("bf", "adf", "haadf"):
                     counts[f"fwd_{ring}_primary"] += 1
+            if ring != "lateral_escape":
+                counts["transmitted_all"] += 1
 
         counts["se1"] = counts["se1_lt50"] + counts["se1_ge50"]
         counts["se2"] = counts["se2_lt50"] + counts["se2_ge50"]
@@ -765,9 +783,14 @@ class PopulationClassifier:
                 counts["lle_primary"] + counts["non_lle_primary"]):
             raise RuntimeError("LLE channels do not partition emitted primaries")
         forward_rings = sum(counts[f"fwd_{ring}"] for ring in TRANSMISSION_RINGS)
-        if counts["forward_all"] != forward_rings:
+        if counts["forward_all"] != forward_rings + counts["fwd_lateral_escape"]:
             raise RuntimeError(
-                "transmission rings do not partition the forward hemisphere"
+                "transmission rings plus lateral escapes do not partition the "
+                "forward hemisphere"
+            )
+        if counts["transmitted_all"] != forward_rings:
+            raise RuntimeError(
+                "transmitted_all must equal the sum of the angular rings"
             )
 
     def emission_labels(self, result: TrajectoryResult):
@@ -888,12 +911,20 @@ class PopulationClassifier:
         return classes
 
     def _exit_hemispheres(self, result):
-        """Map each emission to ``(is_forward, ring_or_None)``.
+        """Map each emission to ``(is_forward, ring_or_lateral_or_None)``.
 
-        Forward means the emitted velocity has a component along the incident
-        beam direction, so the electron left through the far side of the
-        specimen.  On a bulk substrate this set is empty; it becomes populated
-        only when the geometry has a bottom exit surface.
+        Two independent tests are needed, not one.  *Forward* is a property of
+        the emitted velocity: it has a component along the incident beam.
+        *Transmitted* additionally requires that the electron left through a
+        surface facing away from the source, which is what "crossed the
+        specimen" means.
+
+        On a flat foil the two coincide.  On a topographic specimen they do
+        not: a secondary leaving a near-vertical sidewall travels sideways and
+        slightly downward, so it is forward-going but escaped into the trench
+        beside the feature without ever crossing anything.  Judging by exit
+        face separates the two; the sidewall's outward normal is nearly
+        perpendicular to the beam, so its projection is not positive.
         """
         beam = tuple(float(value) for value in result.history.incident_direction)
         detail = {}
@@ -906,6 +937,18 @@ class PopulationClassifier:
             projection = _dot(tuple(float(v) for v in emission.uvw), beam)
             if projection <= 0.0:
                 detail[emission.electron_id] = (False, None)
+                continue
+            if emission.surface_normal is None:
+                raise ValueError(
+                    "transmission classification requires the emission "
+                    "surface normal to tell a far-side exit from a sidewall "
+                    "escape"
+                )
+            face = _dot(
+                tuple(float(v) for v in emission.surface_normal), beam
+            )
+            if face <= 0.0:
+                detail[emission.electron_id] = (True, "lateral_escape")
                 continue
             # Clamp guards against a projection a few ulps above one.
             theta = math.acos(min(1.0, max(-1.0, projection)))

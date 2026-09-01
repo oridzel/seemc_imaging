@@ -377,6 +377,29 @@ python examples/suspended_line_stem_linescan.py MaterialDatabase.pkl \
 Landing energies above the material table's range are warned about rather than
 silently clamped to the table maximum, which matters when going to 30 kV.
 
+### Checking a material database
+
+If `Sample(...)` fails while building splines -- for example with SciPy's
+`ValueError: y must be strictly increasing` -- an interpolation grid in the
+database is not strictly increasing. SciPy names only the spline axis, so run:
+
+```bash
+python examples/check_material_database.py MaterialDatabase.pkl --material Si
+```
+
+It checks `energy`, `omega`, `q` and `decs_theta` for duplicate, unsorted and
+non-finite points, verifies that every dependent array's axis length matches
+its grid, and reports whether the energy range reaches 30 kV. `y` in that
+SciPy message is the **q** grid and `x` is **omega**; the loader now raises a
+message naming the key and the offending index itself.
+
+The two usual causes after rebuilding a database are a q grid whose segments
+were concatenated with an overlapping endpoint (duplicate points) or appended
+out of order. `--fix OUTPUT` writes a repaired copy, sorting grids and dropping
+exact duplicates while applying the same permutation to the ELF columns, so a
+table stored in descending q round-trips exactly. It never interpolates or
+invents data; re-run the checker on the output before using it for physics.
+
 ## Trapezoid metrology sweep and joint fit
 
 Build a small (3\times3\times3) forward-model library around the nominal

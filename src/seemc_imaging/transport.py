@@ -1017,108 +1017,80 @@ class Sample:
     # ------------------------------------------------------------------
     # Inelastic: q sampling from the channel-resolved ELF
     # ------------------------------------------------------------------
-    def _build_elf_channel_splines(self):
-        md = self.material_data
+    @staticmethod
+    def _require_strictly_increasing(values, key):
+        """Interpolation grids must be strictly increasing, not merely sorted.
 
-        omega_h = np.asarray(md["omega"], dtype=np.float64) / H2EV
-        q_raw = np.asarray(md["q"], dtype=np.float64)
-
-        # Convert the database q grid to a0^-1.
-        q_a0inv = (
-            q_raw
-            if self.cfg.q_unit == "a0^-1"
-            else q_raw * A0_ANG
+        SciPy reports a bare "x/y must be strictly increasing" from deep inside
+        the spline constructor, which does not say which table is at fault.
+        Name the key and the first offending pair instead.
+        """
+        values = np.asarray(values, dtype=float)
+        if values.ndim != 1 or values.size < 2:
+            raise ValueError(
+                f"material_data[{key!r}] must be a one-dimensional grid with "
+                f"at least two points; got shape {values.shape}"
+            )
+        if not np.all(np.isfinite(values)):
+            bad = int(np.argmax(~np.isfinite(values)))
+            raise ValueError(
+                f"material_data[{key!r}] is not finite at index {bad} "
+                f"(value {float(values[bad]):g})"
+            )
+        steps = np.diff(values)
+        if np.all(steps > 0.0):
+            return values
+        bad = int(np.argmax(steps <= 0.0))
+        n_flat = int(np.count_nonzero(steps == 0.0))
+        n_down = int(np.count_nonzero(steps < 0.0))
+        if n_down and not n_flat:
+            hint = ("the grid is not sorted ascending; sort it and apply the "
+                    "same permutation to the ELF columns/rows")
+        elif n_flat and not n_down:
+            hint = ("the grid contains repeated values, which usually means "
+                    "two tabulation segments were concatenated with an "
+                    "overlapping endpoint; drop the duplicates and the "
+                    "matching ELF columns/rows")
+        else:
+            hint = ("the grid is both unsorted and contains duplicates, which "
+                    "usually means segments were concatenated out of order")
+        raise ValueError(
+            f"material_data[{key!r}] must be strictly increasing: "
+            f"element {bad} = {float(values[bad]):.10g} is followed by "
+            f"{float(values[bad + 1]):.10g} ({n_flat} repeated and {n_down} "
+            f"decreasing steps out of {steps.size}). {hint.capitalize()}. "
+            "Run examples/check_material_database.py for a full report."
         )
 
+    def _build_elf_channel_splines(self):
+        md = self.material_data
+        omega_raw = self._require_strictly_increasing(md["omega"], "omega")
+        omega_h = omega_raw / H2EV
+        q_raw = self._require_strictly_increasing(md["q"], "q")
+        # ONE declared unit for the whole module (the old code read this key as
+        # A^-1 in elf_spline() and as a0^-1 in elf_channel_splines()).
+        q_a0inv = q_raw if self.cfg.q_unit == "a0^-1" else q_raw * A0_ANG
         if np.any(q_a0inv <= 0):
-            raise ValueError(
-                "material_data['q'] must be strictly positive "
-                "for log-q sampling"
-            )
+            raise ValueError("material_data['q'] must be strictly positive for log-q sampling")
+        qlog = np.log(q_a0inv)
 
-        elf_se = np.asarray(md["elf_se"], dtype=np.float64)
-        elf_pl = np.asarray(md["elf_pl"], dtype=np.float64)
-
-        # Orient ELF arrays using the ORIGINAL q-grid length first.
-        nq_raw = q_a0inv.size
-
-        if elf_se.shape != (omega_h.size, nq_raw):
-            if elf_se.shape == (nq_raw, omega_h.size):
+        elf_se = np.asarray(md["elf_se"], float)
+        elf_pl = np.asarray(md["elf_pl"], float)
+        if elf_se.shape != (omega_h.size, qlog.size):
+            if elf_se.shape == (qlog.size, omega_h.size):
                 elf_se = elf_se.T
                 elf_pl = elf_pl.T
             else:
                 raise ValueError(
-                    f"ELF shape {elf_se.shape} matches neither "
-                    f"(Nw, Nq)=({omega_h.size}, {nq_raw}) "
-                    f"nor its transpose"
+                    f"ELF shape {elf_se.shape} matches neither (Nw, Nq) = "
+                    f"({omega_h.size}, {qlog.size}) nor its transpose"
                 )
-
-        if elf_pl.shape != elf_se.shape:
-            raise ValueError(
-                f"elf_pl shape {elf_pl.shape} does not match "
-                f"elf_se shape {elf_se.shape}"
-            )
-
-        # q may contain the almost-identical linear/log splice points.
-        if np.any(np.diff(q_a0inv) < 0.0):
-            raise ValueError(
-                "material_data['q'] must be monotonically increasing"
-            )
-
-        qlog = np.log(q_a0inv)
-
-        # Two distinct q values can collapse to exactly the same float64
-        # after log(). RectBivariateSpline requires strict monotonicity.
-        keep = np.ones(qlog.size, dtype=bool)
-        keep[1:] = np.diff(qlog) > 0.0
-
-        n_removed = int(np.count_nonzero(~keep))
-
-        if n_removed:
-            bad = np.flatnonzero(~keep)
-
-            details = ", ".join(
-                f"i={i}: q={q_raw[i]:.17g}"
-                for i in bad[:5]
-            )
-
-            warnings.warn(
-                f"Removed {n_removed} duplicate log-q grid point(s) "
-                f"from material '{self.name}' before building ELF "
-                f"splines ({details})",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-
-            # CRITICAL: delete the matching ELF columns too.
-            qlog = qlog[keep]
-            elf_se = elf_se[:, keep]
-            elf_pl = elf_pl[:, keep]
-
-        if qlog.size < 2 or not np.all(np.diff(qlog) > 0.0):
-            raise ValueError(
-                "ELF q grid is not strictly increasing "
-                "after duplicate cleanup"
-            )
 
         self._omega_h_grid = omega_h
         self._qlog_grid = qlog
-
         self._elf_spl = {
-            "se": RectBivariateSpline(
-                omega_h,
-                qlog,
-                elf_se,
-                kx=1,
-                ky=1,
-            ),
-            "pl": RectBivariateSpline(
-                omega_h,
-                qlog,
-                elf_pl,
-                kx=1,
-                ky=1,
-            ),
+            "se": RectBivariateSpline(omega_h, qlog, elf_se, kx=1, ky=1),
+            "pl": RectBivariateSpline(omega_h, qlog, elf_pl, kx=1, ky=1),
         }
 
     def mao_q_boundaries(self, omega):

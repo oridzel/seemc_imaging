@@ -157,7 +157,19 @@ forward beam axis, in milliradians, with exclusive upper bounds:
 | `fwd_beyond_haadf` | theta >= 200 mrad |
 
 `fwd_beyond_haadf` exists to close the partition out to 90 degrees; it is not a
-physical detector. These are **collection angles, not a detector response**:
+physical detector.
+
+**Forward is not the same as transmitted.** Being forward-going is a property
+of the emitted velocity; being *transmitted* additionally requires leaving
+through a surface that faces away from the source, which is what "crossed the
+specimen" means. On a flat foil the two coincide. On a topographic specimen
+they do not: a secondary leaving a near-vertical sidewall travels sideways and
+slightly downward, so it is forward-going but escaped into the trench beside
+the feature without crossing anything. Those land in `fwd_lateral_escape`; the
+angular rings and `transmitted_all` contain only far-side exits. The
+distinction is not academic -- on a 50 nm line at 0.9 kV, where the specimen is
+opaque and true transmission is exactly zero, the entire forward hemisphere is
+sidewall escape, peaking at the sidewall and vanishing over flat membrane. These are **collection angles, not a detector response**:
 solid-angle weighting, gain, the BF-disc/detector-hole geometry of a real
 holder, and any post-specimen optics are forward-model steps applied
 afterwards, in the same spirit as the note that a real SEM fit must
