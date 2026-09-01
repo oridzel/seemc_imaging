@@ -122,16 +122,30 @@ def check(material, *, verbose=True):
                 if verbose:
                     print(f"          - {findings[-1]}")
 
+    energy = np.asarray(material.get("energy", []), dtype=float)
+    e_fermi = float(material.get("e_fermi", 0.0))
     for array_name in ("elf_se", "elf_pl", "decs", "diimfp_se", "diimfp_pl",
                        "imfp", "emfp"):
         if array_name not in material:
             continue
         array = np.asarray(material[array_name], dtype=float)
-        if not np.all(np.isfinite(array)):
-            count = int(np.count_nonzero(~np.isfinite(array)))
-            findings.append(f"{array_name}: {count} non-finite entries")
+        if np.all(np.isfinite(array)):
+            continue
+        bad = ~np.isfinite(array)
+        count = int(np.count_nonzero(bad))
+        # There is no inelastic channel below the Fermi level, so a
+        # non-finite IMFP there is how the table says "no scattering".  The
+        # loader turns it into a zero inverse MFP, which is correct.
+        if (array_name == "imfp" and energy.size == array.size
+                and np.all(energy[bad] <= e_fermi)):
             if verbose:
-                print(f"  [BAD] {array_name}: {count} non-finite entries")
+                print(f"  [ok ] imfp: {count} non-finite entries, all at or "
+                      f"below E_F = {e_fermi:g} eV (expected: no inelastic "
+                      "channel there)")
+            continue
+        findings.append(f"{array_name}: {count} non-finite entries")
+        if verbose:
+            print(f"  [BAD] {array_name}: {count} non-finite entries")
 
     if verbose and "energy" in material:
         energy = np.asarray(material["energy"], dtype=float)
@@ -176,6 +190,10 @@ def mfp_report(material, *, verbose=True, number_density_cm3=4.99e22,
         if Z:
             header += f" {'EMFP/Rutherford':>17s}"
         print(header)
+        if not Z:
+            print("    (no atomic_number in the database, so the "
+                  "EMFP/Rutherford sanity column is omitted;")
+            print("     pass --atomic-number to enable it)")
     worst_ratio, worst_energy = None, None
     if Z:
         for e_val, m_val in zip(energy, emfp):
