@@ -21,13 +21,16 @@ named converter in `Sample` and never touches `material_data` directly.
             electron is inside the solid.  It equals T' in Shinotsuka et al.,
             Surf. Interface Anal. 47 (2015) 871, Eq. (2).
 
-    T       = E_s - E_F, measured from the FERMI LEVEL.  This is the abscissa
-            of the standard IMFP tables (Shinotsuka Table 2: "electron kinetic
-            energy T with respect to the Fermi level").
+    T       For a metal, E_s - E_F (Fermi-level referenced).  For a
+            semiconductor/insulator, the FPA input T is E_s itself and the
+            kinematic energy is T' = E_s - E_g (Shinotsuka Eq. 7).
 
-    E_vac   = E_s - U_i  with  U_i = E_F + phi,  the kinetic energy the
-            electron would have in vacuum.  Used for emission, NOT for table
-            lookups.
+    E_CB    = E_s - (E_v + E_g), measured from the CONDUCTION-BAND MINIMUM.
+            This is used only for a nonconductor's promoted secondary.
+
+    E_vac   = E_s - U_i, the kinetic energy in vacuum.  For a metal,
+            U_i = E_F + phi.  For a nonconductor,
+            U_i = E_v + E_g + chi, where chi is the electron affinity.
 
     NOTE ON THE ELASTIC TABLES.  It is tempting to assume ELSEPA is fed a
     vacuum kinetic energy.  For the solid-state (muffin-tin) optical model it
@@ -56,10 +59,16 @@ Which reference each DB table uses is declared once, in `MCConfig`:
                        convention described above)
                        or 'vacuum' (legacy comparison only)
 
-KINEMATIC INVARIANTS (Shinotsuka Eq. 2-3) -- these are asserted, not assumed:
+KINEMATIC INVARIANTS (Shinotsuka Eq. 7-8) -- asserted, not assumed:
 
-    omega_max = T' - E_F = E_s - E_F        (maximum energy loss)
-    q_bounds  are evaluated at T' = E_s     (NOT at E_s - E_F)
+    metal:        omega_max = E_s - E_F; q uses E_s
+    nonconductor: E_g <= omega <= E_s - E_g - E_v;
+                  q uses T' = E_s - E_g
+
+For a nonconductor the inelastic rate is therefore zero below
+E_s = E_v + 2 E_g.  If the initial valence state is epsilon_v above the
+valence-band bottom, the promoted electron has
+E_CB = epsilon_v + omega - E_v - E_g.
 
 The relativistic momenta used for the q-bounds are also used for the
 projectile deflection, so the sampled q is guaranteed to lie in
@@ -218,6 +227,13 @@ class MCConfig:
     # None means: use material_data['work_function'] exactly as before.
     work_function_ev: Optional[float] = None
 
+    # Optional nonconductor surface-barrier override.  For a semiconductor or
+    # insulator the barrier above the conduction-band minimum is the electron
+    # affinity chi, not a metal work function.  None means: read
+    # material_data['electron_affinity']; legacy databases may supply the same
+    # number under 'work_function'.
+    electron_affinity_ev: Optional[float] = None
+
     # Apply the reciprocal vacuum->solid surface-barrier scattering to the
     # incident primary. Historically SEEMC refracted every primary into the
     # solid with probability 1, while the solid->vacuum barrier in Electron.escape()
@@ -273,6 +289,11 @@ class MCConfig:
     # with the incident direction; isotropic is the standard choice
     # (Ding & Shimizu).  'momentum' reuses the binary-encounter construction.
     plasmon_se_direction: str = "isotropic"
+    # The valence-band target model fixes the promoted electron's energy but
+    # does not supply a crystal-momentum-resolved angular distribution.
+    # Isotropic is therefore the conservative default for nonconductors;
+    # 'momentum' aligns it with the sampled transfer q as a comparison model.
+    semiconductor_se_direction: str = "isotropic"
 
     # --- termination ---
     # An electron with E_s <= U_i can never escape through a step barrier and
@@ -308,6 +329,11 @@ class MCConfig:
             raise ValueError(f"bad se_direction_model: {self.se_direction_model}")
         if self.plasmon_se_direction not in ("momentum", "isotropic"):
             raise ValueError(f"bad plasmon_se_direction: {self.plasmon_se_direction}")
+        if self.semiconductor_se_direction not in ("momentum", "isotropic"):
+            raise ValueError(
+                "bad semiconductor_se_direction: "
+                f"{self.semiconductor_se_direction}"
+            )
         if self.barrier_model == "quantum":
             self.barrier_model = "abrupt"        # backwards-compatible synonym
         _alias = {"quantum": "abrupt", "sigmoid": "expqm", "jmonsel": "expqm"}
@@ -325,6 +351,13 @@ class MCConfig:
                     or self.work_function_ev <= 0.0):
                 raise ValueError(
                     "work_function_ev must be a finite positive value in eV"
+                )
+        if self.electron_affinity_ev is not None:
+            self.electron_affinity_ev = float(self.electron_affinity_ev)
+            if (not math.isfinite(self.electron_affinity_ev)
+                    or self.electron_affinity_ev < 0.0):
+                raise ValueError(
+                    "electron_affinity_ev must be finite and non-negative"
                 )
         if self.se_channel_rule not in ("mao", "table"):
             raise ValueError(f"bad se_channel_rule: {self.se_channel_rule}")
@@ -678,14 +711,57 @@ class Sample:
         self.Emax = float(self.Egrid[-1])
 
         self.e_fermi = float(md.get("e_fermi", 0.0))
+        self.e_vb = float(md.get(
+            "e_vb", md.get("width_of_the_valence_band", 0.0)
+        ))
+        self.band_gap = float(md.get("band_gap", md.get("e_gap", 0.0)))
+        self.e_cbm = self.e_vb + self.band_gap
+
         self.work_function_db = float(md.get("work_function", 0.0))
-        self.work_function = float(
-            self.cfg.work_function_ev
-            if self.cfg.work_function_ev is not None
-            else self.work_function_db
-        )
-        self.Ui = self.e_fermi + self.work_function     # VB bottom -> vacuum level
-        self.e_vb = float(md.get("e_vb", 0.0))
+        if self.is_metal:
+            self.work_function = float(
+                self.cfg.work_function_ev
+                if self.cfg.work_function_ev is not None
+                else self.work_function_db
+            )
+            self.electron_affinity = 0.0
+            self.surface_barrier = self.work_function
+            self.Ui = self.e_fermi + self.work_function
+        else:
+            if self.e_vb <= 0.0 or self.band_gap <= 0.0:
+                raise ValueError(
+                    "A nonconductor database must define positive e_vb "
+                    "(or width_of_the_valence_band) and band_gap (or e_gap)"
+                )
+            affinity_db = md.get(
+                "electron_affinity", md.get("affinity", md.get("work_function"))
+            )
+            if affinity_db is None:
+                raise ValueError(
+                    "A nonconductor database must define electron_affinity; "
+                    "legacy databases may store the same barrier as work_function"
+                )
+            self.electron_affinity_db = float(affinity_db)
+            # work_function_ev remains a backwards-compatible override for old
+            # command lines, but the explicitly named affinity option wins.
+            affinity_override = (
+                self.cfg.electron_affinity_ev
+                if self.cfg.electron_affinity_ev is not None
+                else self.cfg.work_function_ev
+            )
+            self.electron_affinity = float(
+                affinity_override
+                if affinity_override is not None
+                else self.electron_affinity_db
+            )
+            if (not math.isfinite(self.electron_affinity)
+                    or self.electron_affinity < 0.0):
+                raise ValueError("electron_affinity must be finite and non-negative")
+            # Compatibility alias; do not interpret it as a semiconductor work
+            # function.  The physical escape barrier is chi above the CBM.
+            self.work_function = self.electron_affinity
+            self.surface_barrier = self.electron_affinity
+            self.Ui = self.e_cbm + self.electron_affinity
 
         # Fermi energy used ONLY by the binary-encounter SE kinematics.  Kept
         # separate from self.e_fermi (which sets omega_max and the barrier)
@@ -795,8 +871,21 @@ class Sample:
                 f"required at E = {self.Emax:.4g} eV. Check q_unit."
             )
 
-        lines.append(f"  E_F = {self.e_fermi:.3f} eV, phi = {self.work_function:.3f} eV, "
-                     f"U_i = {self.Ui:.3f} eV")
+        if self.is_metal:
+            lines.append(
+                f"  metal: E_F = {self.e_fermi:.3f} eV, "
+                f"phi = {self.work_function:.3f} eV, U_i = {self.Ui:.3f} eV"
+            )
+        else:
+            lines.append(
+                f"  nonconductor: E_v = {self.e_vb:.3f} eV, "
+                f"E_g = {self.band_gap:.3f} eV, E_CBM = {self.e_cbm:.3f} eV, "
+                f"chi = {self.electron_affinity:.3f} eV, U_i = {self.Ui:.3f} eV"
+            )
+            lines.append(
+                "  electronic threshold E_v + 2 E_g = "
+                f"{self.inelastic_threshold:.3f} eV (VB-bottom reference)"
+            )
         lines.append(f"  IMFP tabulated vs '{self.cfg.imfp_energy_ref}', "
                      f"EMFP vs '{self.cfg.emfp_energy_ref}'")
         return "\n".join(lines)
@@ -809,6 +898,10 @@ class Sample:
 
     def E_vacuum_ref(self, E_s):
         return E_s - self.Ui
+
+    def E_conduction_ref(self, E_s):
+        """Energy above the CBM (meaningful only for a nonconductor)."""
+        return E_s - self.e_cbm
 
     def _imfp_abscissa(self, E_s):
         return E_s if self.cfg.imfp_energy_ref == "vb_bottom" else self.E_fermi_ref(E_s)
@@ -877,16 +970,31 @@ class Sample:
             inv_e = float(np.interp(self._clip_E(self._emfp_abscissa(Ec)),
                                     self.Egrid, self.inv_emfp_table)
                           ) * self.elastic_sigma_scale(E_s)
-        if self.is_metal and E_s <= self.e_fermi:
-            inv_i = 0.0            # no inelastic channel below E_F
+        if E_s <= self.inelastic_threshold:
+            inv_i = 0.0
         else:
             inv_i = float(np.interp(self._clip_E(self._imfp_abscissa(E_s)),
                                     self.Egrid, self.inv_imfp_table))
         return inv_e, inv_i
 
+    @property
+    def inelastic_threshold(self):
+        """Lowest E_s at which the electronic loss domain is non-empty."""
+        return self.e_fermi if self.is_metal else self.e_vb + 2.0 * self.band_gap
+
+    def omega_min(self, E_s=None):
+        """Lower electronic-loss limit in eV."""
+        return 0.0 if self.is_metal else self.band_gap
+
     def omega_max(self, E_s):
-        """Shinotsuka Eq. (3): omega_max = T' - E_F for a metal."""
-        return E_s - self.e_fermi if self.is_metal else E_s
+        """Upper electronic-loss limit on the VB-bottom energy reference."""
+        if self.is_metal:
+            return E_s - self.e_fermi
+        return E_s - self.band_gap - self.e_vb
+
+    def inelastic_kinetic_energy(self, E_s):
+        """T' used by the FPA q window (Shinotsuka Eq. 7-8)."""
+        return E_s if self.is_metal else E_s - self.band_gap
 
     # ------------------------------------------------------------------
     # Elastic
@@ -973,6 +1081,8 @@ class Sample:
         return self._w_pl, self._cdf_pl, self._has_pl
 
     def choose_channel(self, E_s, rng):
+        if E_s <= self.inelastic_threshold:
+            return None
         E = self._clip_E(self._imfp_abscissa(E_s))
         inv_pl = float(np.interp(E, self.Egrid, self.material_data["inv_imfp_pl"]))
         inv_se = float(np.interp(E, self.Egrid, self.material_data["inv_imfp_se"]))
@@ -984,7 +1094,8 @@ class Sample:
     def sample_energy_loss(self, ch, E_s, rng, diag):
         """
         Draw omega from the channel DIIMFP, with the CDF truncated at
-        omega_max = E_s - E_F.  Truncating BEFORE sampling (rather than
+        the physical [omega_min, omega_max] interval. Truncating BEFORE sampling
+        (rather than
         sampling then rejecting) keeps the realised inelastic rate equal to
         1/imfp; the old code's post-hoc rejection quietly lengthened the
         effective IMFP and softened the stopping power.
@@ -1000,18 +1111,21 @@ class Sample:
         wgrid = w_all[:, j]
         cdf = cdf_all[:, j]
 
+        w_min = max(self.omega_min(E_s), float(wgrid[0]))
         w_max = min(self.omega_max(E_s), float(wgrid[-1]))
-        if w_max <= float(wgrid[0]):
+        if w_max <= w_min:
             diag["omega_cdf_empty"] += 1
             return None
 
+        c_min = float(np.interp(w_min, wgrid, cdf))
         c_max = float(np.interp(w_max, wgrid, cdf))
-        if c_max <= 0.0 or not np.isfinite(c_max):
+        if (c_max <= c_min or not np.isfinite(c_min)
+                or not np.isfinite(c_max)):
             diag["omega_cdf_empty"] += 1
             return None
 
-        omega = _invert_cdf(cdf, wgrid, rng.random() * c_max)
-        omega = min(omega, w_max)
+        omega = _invert_cdf(cdf, wgrid, c_min + rng.random() * (c_max - c_min))
+        omega = min(max(omega, w_min), w_max)
         return omega if omega > 0.0 else None
 
     # ------------------------------------------------------------------
@@ -1113,13 +1227,13 @@ class Sample:
         """
         Relativistic momentum-transfer bounds in log(q / a0^-1).
 
-        Shinotsuka Eq. (2): the bounds are evaluated at T' = E_s, the
-        VB-bottom-referenced energy -- NOT at E_s - E_F.  Using E_s - E_F
-        here (as the previous version did) narrows the q window and biases
-        every inelastic deflection angle.
+        For a metal Shinotsuka uses T' = E_s. For a nonconductor Eq. (7)-(8)
+        uses T' = E_s - E_g. The returned momenta are the same ones used for
+        the projectile deflection.
         """
-        k = _k_rel_au(E_s)
-        kp = _k_rel_au(max(E_s - omega, 0.0))
+        t_prime = self.inelastic_kinetic_energy(E_s)
+        k = _k_rel_au(t_prime)
+        kp = _k_rel_au(max(t_prime - omega, 0.0))
         q_minus = abs(k - kp)
         q_plus = k + kp
         if q_minus <= 0.0 or q_plus <= q_minus:
@@ -1229,6 +1343,39 @@ class Sample:
             if rng.random() * f_max <= math.sqrt(e * (e + omega)):
                 return e
         return 0.5 * e_ref
+
+    def sample_semiconductor_target_energy(self, omega, rng):
+        """Draw the occupied valence state promoted by an electronic loss.
+
+        The returned ``epsilon_v`` is measured upward from the valence-band
+        bottom.  Requiring ``epsilon_v + omega >= E_CBM`` is equivalent to
+
+            E_sec,CB = omega - E_g - (E_v - epsilon_v) >= 0.
+
+        Within the allowed interval the same free-electron joint-DOS weight
+        used by the earlier plasmon-decay model is retained.  This changes the
+        reference and support without inventing an independent CBM input.
+        """
+        if self.is_metal:
+            raise RuntimeError(
+                "sample_semiconductor_target_energy called for a metal"
+            )
+        lower = max(0.0, self.e_cbm - float(omega))
+        upper = self.e_vb
+        if lower > upper:
+            return None
+
+        def weight(epsilon_v):
+            return math.sqrt(max(epsilon_v * (epsilon_v + omega), 0.0))
+
+        f_max = weight(upper)
+        if f_max <= 0.0:
+            return upper
+        for _ in range(200):
+            epsilon_v = lower + rng.random() * (upper - lower)
+            if rng.random() * f_max <= weight(epsilon_v):
+                return epsilon_v
+        return 0.5 * (lower + upper)
 
 
 # --------------------------------------------------------------------------
@@ -1957,7 +2104,7 @@ class Electron:
         # table the pair happened to be drawn from.  The transport (energy
         # loss, deflection) is unaffected because the tables sum to the total;
         # only the secondary-electron construction changes.
-        if self.cfg.se_channel_rule == "mao":
+        if smp.is_metal and self.cfg.se_channel_rule == "mao":
             q_minus, q_plus = smp.mao_q_boundaries(omega)
             mech = "se" if (q_minus <= q <= q_plus) else "pl"
             if mech != ch:
@@ -1977,7 +2124,13 @@ class Electron:
         self._record()
 
         # --- secondary electron
-        if ch == "se":
+        if not smp.is_metal:
+            secondary = self._secondary_from_semiconductor(
+                uvw_before, theta_p, phi_p, omega, q, k, kp, diag,
+                sampled_channel=sampled_channel,
+                parent_energy_before=energy_before,
+            )
+        elif ch == "se":
             secondary = self._secondary_from_binary_encounter(
                 uvw_before, theta_p, phi_p, omega, q, k, kp, diag,
                 sampled_channel, energy_before,
@@ -2085,6 +2238,47 @@ class Electron:
             sampled_channel=sampled_channel,
             parent_energy_before=(None if parent_energy_before is None
                                   else float(parent_energy_before)),
+            parent_energy_after=float(self.energy),
+            parent_direction_before=_vec3(uvw_before),
+            parent_direction_after=_vec3(self.uvw),
+        )
+
+    def _secondary_from_semiconductor(self, uvw_before, theta_p, phi_p,
+                                      omega, q, k, kp, diag, *,
+                                      sampled_channel,
+                                      parent_energy_before):
+        """Promote one occupied valence electron into the conduction band."""
+        smp = self.sample
+        epsilon_v = smp.sample_semiconductor_target_energy(omega, self.rng)
+        if epsilon_v is None:
+            # A regenerated semiconductor DIIMFP cannot reach this branch:
+            # its omega support already enforces an available valence state.
+            diag["se_below_cbm"] = diag.get("se_below_cbm", 0) + 1
+            return None
+
+        # VB-bottom storage and CBM-referenced transport energy are equivalent:
+        # E_s = epsilon_v + omega
+        # E_CB = omega - E_g - (E_v - epsilon_v).
+        E_se = epsilon_v + omega
+        E_se_cb = E_se - smp.e_cbm
+        if E_se_cb < -1.0e-10:
+            diag["se_below_cbm"] = diag.get("se_below_cbm", 0) + 1
+            return None
+        E_se = max(E_se, smp.e_cbm)
+
+        if self.cfg.semiconductor_se_direction == "isotropic":
+            uvw = _isotropic_direction(self.rng)
+        else:
+            # The optical/JDOS model has no resolved initial crystal momentum.
+            # Its only directional datum is q, so the comparison model launches
+            # the promoted electron along the sampled transfer direction.
+            uvw = self._q_hat(uvw_before, theta_p, phi_p, k, kp)
+
+        return Secondary(
+            E_se, uvw, list(self.xyz), self.generation + 1,
+            mechanism=f"semiconductor_{sampled_channel}",
+            sampled_channel=sampled_channel,
+            parent_energy_before=float(parent_energy_before),
             parent_energy_after=float(self.energy),
             parent_direction_before=_vec3(uvw_before),
             parent_direction_after=_vec3(self.uvw),
