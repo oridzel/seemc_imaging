@@ -2582,7 +2582,8 @@ def simulate_trajectory(sample: Sample, E0, angle_rad, rng, track=False,
         diag["escapes"] += 1
         res.tey = 1
         res.bse_cascade = 1
-        if float(E0) < cfg.bse_cutoff_ev:
+        tol_ev = 1e-9
+        if float(E0) <= cfg.bse_cutoff_ev + tol_ev:
             res.sey_50ev = 1
         else:
             res.bse_50ev = 1
@@ -2725,7 +2726,9 @@ def simulate_trajectory(sample: Sample, E0, angle_rad, rng, track=False,
                         res.sey_cascade += 1
                     else:
                         res.bse_cascade += 1
-                    if e.energy < cfg.bse_cutoff_ev:
+                    tol_ev = 1e-9
+
+                    if e.energy <= cfg.bse_cutoff_ev + tol_ev:
                         res.sey_50ev += 1
                     else:
                         res.bse_50ev += 1
