@@ -25,6 +25,7 @@ from .geometry import Plane
 from .transport import MCConfig, SEEMC
 from .plane_sampler_joint_export import (
     direction_angles,
+    joint_sampler_filenames,
     write_joint_angle_samplers,
 )
 
@@ -142,9 +143,14 @@ class PlaneSamplerCase:
     @property
     def incoming_barrier_reflections(self) -> int:
         """Number of primaries reflected directly at the vacuum->solid barrier."""
-        return int(np.count_nonzero(
-            self.bse_emission_mechanism == "incoming_barrier_reflection"
-        ))
+        return int(
+            np.count_nonzero(
+                self.se_emission_mechanism == "incoming_barrier_reflection"
+            )
+            + np.count_nonzero(
+                self.bse_emission_mechanism == "incoming_barrier_reflection"
+            )
+        )
 
     @property
     def incoming_barrier_reflection_fraction(self) -> float:
@@ -161,8 +167,8 @@ class PlaneSamplerCase:
     def validate(self, tolerance: float = 1.0e-9) -> None:
         if self.n_primaries < 1:
             raise ValueError("n_primaries must be positive")
-        if self.incident_energy_ev <= self.energy_cutoff_ev:
-            raise ValueError("incident energy must exceed the SE/BSE cutoff")
+        if not math.isfinite(self.incident_energy_ev) or self.incident_energy_ev <= 0.0:
+            raise ValueError("incident energy must be finite and positive")
         pairs = (
             (
                 self.se_energy_ev, self.se_theta_deg, self.se_phi_deg,
@@ -264,49 +270,73 @@ class PlaneSamplerCase:
         # Direct incoming-barrier reflections have an exact planar fingerprint:
         # Eout=E0, theta=2*alpha, phi=0.  Enforce it so a future coordinate
         # convention change cannot silently corrupt the sharp specular lobe.
-        if np.any(self.se_emission_mechanism == "incoming_barrier_reflection"):
-            raise ValueError(
-                "incoming-barrier reflected primaries must be BSE for this "
-                "sampler because incident_energy_ev exceeds the 50 eV cutoff"
-            )
-        reflected = (
-            self.bse_emission_mechanism == "incoming_barrier_reflection"
-        )
-        if np.any(reflected):
-            expected_theta = 2.0 * self.incidence_angle_deg
+        # Below the SE/BSE cutoff these reflected primaries live in the legacy
+        # SE energy class; at/above the cutoff they live in the BSE class.
+        expected_theta = 2.0 * self.incidence_angle_deg
+        for energies, theta, phi, mechanism, barrier_r, label in (
+            (
+                self.se_energy_ev, self.se_theta_deg, self.se_phi_deg,
+                self.se_emission_mechanism,
+                self.se_barrier_reflection_probability, "SE",
+            ),
+            (
+                self.bse_energy_ev, self.bse_theta_deg, self.bse_phi_deg,
+                self.bse_emission_mechanism,
+                self.bse_barrier_reflection_probability, "BSE",
+            ),
+        ):
+            reflected = mechanism == "incoming_barrier_reflection"
+            if not np.any(reflected):
+                continue
             if not np.allclose(
-                self.bse_energy_ev[reflected],
+                energies[reflected],
                 self.incident_energy_ev,
                 rtol=0.0,
                 atol=max(tolerance, 1.0e-10),
             ):
                 raise ValueError(
-                    "incoming-barrier reflected primary did not retain E0"
+                    f"{label} incoming-barrier reflected primary did not retain E0"
                 )
             if not np.allclose(
-                self.bse_theta_deg[reflected],
+                theta[reflected],
                 expected_theta,
                 rtol=0.0,
                 atol=2.0e-9,
             ):
                 raise ValueError(
-                    "incoming-barrier reflected primary is not at theta=2*alpha"
+                    f"{label} incoming-barrier reflected primary is not at theta=2*alpha"
                 )
             if not np.allclose(
-                self.bse_phi_deg[reflected],
+                phi[reflected],
                 0.0,
                 rtol=0.0,
                 atol=2.0e-9,
             ):
                 raise ValueError(
-                    "incoming-barrier reflected primary is not at phi=0"
+                    f"{label} incoming-barrier reflected primary is not at phi=0"
                 )
-            if not np.all(np.isfinite(
-                self.bse_barrier_reflection_probability[reflected]
-            )):
+            if not np.all(np.isfinite(barrier_r[reflected])):
                 raise ValueError(
-                    "incoming-barrier reflected primary lacks its reflection probability"
+                    f"{label} incoming-barrier reflected primary lacks its "
+                    "reflection probability"
                 )
+
+        se_reflected = (
+            self.se_emission_mechanism == "incoming_barrier_reflection"
+        )
+        bse_reflected = (
+            self.bse_emission_mechanism == "incoming_barrier_reflection"
+        )
+        if self.incident_energy_ev < self.energy_cutoff_ev and np.any(bse_reflected):
+            raise ValueError(
+                "incoming-barrier reflected primaries below the cutoff must be "
+                "stored in the SE energy class"
+            )
+        if self.incident_energy_ev >= self.energy_cutoff_ev and np.any(se_reflected):
+            raise ValueError(
+                "incoming-barrier reflected primaries at/above the cutoff must be "
+                "stored in the BSE energy class"
+            )
 
 
 def _config_json(config: MCConfig) -> str:
@@ -347,8 +377,8 @@ def run_plane_sampler_case(
         raise ValueError("n_primaries must be positive")
     energy = float(incident_energy_ev)
     angle = float(incidence_angle_deg)
-    if energy <= config.bse_cutoff_ev:
-        raise ValueError("incident energy must exceed config.bse_cutoff_ev")
+    if not math.isfinite(energy) or energy <= 0.0:
+        raise ValueError("incident energy must be finite and positive")
     vacuum, outward, beam_back = plane_directions(angle)
 
     model = SEEMC(
@@ -690,11 +720,18 @@ def export_angle_tables(directory, cases: Sequence[PlaneSamplerCase],
             if kind == "SE":
                 samples = case.se_energy_ev if value == "energy" else case.se_theta_deg
                 lower = 0.0
-                upper = cutoff if value == "energy" else 90.0 + angle
+                upper = (
+                    min(cutoff, case.incident_energy_ev)
+                    if value == "energy" else 90.0 + angle
+                )
             else:
                 samples = case.bse_energy_ev if value == "energy" else case.bse_theta_deg
                 lower = cutoff if value == "energy" else 0.0
                 upper = case.incident_energy_ev if value == "energy" else 90.0 + angle
+            # A zero-yield class has no conditional distribution.  Keep its
+            # yield row (SEY/BSEY=0), but omit sampler rows for that energy.
+            if samples.size == 0:
+                continue
             quantiles = _inverse_cdf(samples, probabilities, lower, upper)
             for probability, quantile in zip(probabilities, quantiles):
                 yield (
@@ -810,8 +847,8 @@ def generate_plane_sampler_library(
         raise ValueError("energy and angle grids must both be non-empty")
     for angle in angles:
         plane_directions(angle)
-    if any(energy <= config.bse_cutoff_ev for energy in energies):
-        raise ValueError("every energy must exceed config.bse_cutoff_ev")
+    if any(not math.isfinite(energy) or energy <= 0.0 for energy in energies):
+        raise ValueError("every incident energy must be finite and positive")
     n_primaries = int(n_primaries)
     workers = int(workers)
     if n_primaries < 1 or workers < 1:
@@ -877,7 +914,7 @@ def generate_plane_sampler_library(
             for case in angle_cases
         ]
         joint_paths = write_joint_angle_samplers(
-            angle_case_paths, angle_output
+            angle_case_paths, angle_output, material=material
         )
         if status is not None:
             status(
@@ -927,8 +964,7 @@ def generate_plane_sampler_library(
             ),
         },
         "joint_sampler_files": {
-            "SE": "SEJointFromPlaneSampler_uncoatedCuFPA.npz",
-            "BSE": "BSEJointFromPlaneSampler_uncoatedCuFPA.npz",
+            **joint_sampler_filenames(material),
             "schema": "seemc-joint-emission-v1",
         },
         "incoming_barrier_reflection": bool(

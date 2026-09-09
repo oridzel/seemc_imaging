@@ -118,7 +118,18 @@ def save_case_v2(path, **kwargs):
     np.savez_compressed(path,**case_payload_v2(**kwargs)); return path
 
 
-def write_joint_angle_samplers(case_paths, output_dir):
+def joint_sampler_filenames(material):
+    """Return material-aware filenames for the two joint sampler files."""
+    token=''.join(ch for ch in str(material) if ch.isalnum() or ch in ('_','-'))
+    if not token:
+        raise ValueError('material must contain at least one filename-safe character')
+    return {
+        'SE':f'SEJointFromPlaneSampler_uncoated{token}FPA.npz',
+        'BSE':f'BSEJointFromPlaneSampler_uncoated{token}FPA.npz',
+    }
+
+
+def write_joint_angle_samplers(case_paths, output_dir, *, material='Cu'):
     """Aggregate v2 per-energy cases into RFA-ready BSE/SE joint NPZ files."""
     output_dir=Path(output_dir); output_dir.mkdir(parents=True,exist_ok=True)
     accum={k:{'Einc':[],'Eout':[],'theta':[],'phi':[],'mb':[],'mt':[],'ms':[]} for k in ('SE','BSE')}
@@ -133,9 +144,7 @@ def write_joint_angle_samplers(case_paths, output_dir):
                 a['Einc'].append(np.full(n,Ei)); a['Eout'].append(z[f'{prefix}_energy_ev'])
                 a['theta'].append(z[f'{prefix}_theta_deg']); a['phi'].append(z[f'{prefix}_phi_deg'])
                 a['mb'].append(z[f'{prefix}_mu_beam_back']); a['mt'].append(z[f'{prefix}_mu_toward_normal']); a['ms'].append(z[f'{prefix}_mu_side'])
-    names={
-      'SE':'SEJointFromPlaneSampler_uncoatedCuFPA.npz',
-      'BSE':'BSEJointFromPlaneSampler_uncoatedCuFPA.npz'}
+    names=joint_sampler_filenames(material)
     result={}
     for kind,a in accum.items():
         cat=lambda k: np.concatenate(a[k]) if a[k] else np.empty(0)
