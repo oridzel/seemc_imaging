@@ -233,14 +233,14 @@ class PlaneSamplerCase:
             raise ValueError("BSE per-primary counts do not match raw emissions")
         if self.se_energy_ev.size and (
             float(self.se_energy_ev.min()) < -tolerance
-            or float(self.se_energy_ev.max()) >= self.energy_cutoff_ev + tolerance
+            or float(self.se_energy_ev.max()) > self.energy_cutoff_ev + tolerance
         ):
-            raise ValueError("SE energies violate the < cutoff definition")
+            raise ValueError("SE energies violate the <= cutoff definition")
         if self.bse_energy_ev.size and (
-            float(self.bse_energy_ev.min()) < self.energy_cutoff_ev - tolerance
+            float(self.bse_energy_ev.min()) <= self.energy_cutoff_ev
             or float(self.bse_energy_ev.max()) > self.incident_energy_ev + tolerance
         ):
-            raise ValueError("BSE energies violate the >= cutoff definition")
+            raise ValueError("BSE energies violate the > cutoff definition")
         theta_max = 90.0 + self.incidence_angle_deg
         all_theta = np.concatenate((self.se_theta_deg, self.bse_theta_deg))
         if all_theta.size and (
@@ -270,8 +270,8 @@ class PlaneSamplerCase:
         # Direct incoming-barrier reflections have an exact planar fingerprint:
         # Eout=E0, theta=2*alpha, phi=0.  Enforce it so a future coordinate
         # convention change cannot silently corrupt the sharp specular lobe.
-        # Below the SE/BSE cutoff these reflected primaries live in the legacy
-        # SE energy class; at/above the cutoff they live in the BSE class.
+        # At or below the SE/BSE cutoff these reflected primaries live in the
+        # legacy SE energy class; above the cutoff they live in the BSE class.
         expected_theta = 2.0 * self.incidence_angle_deg
         for energies, theta, phi, mechanism, barrier_r, label in (
             (
@@ -327,14 +327,14 @@ class PlaneSamplerCase:
         bse_reflected = (
             self.bse_emission_mechanism == "incoming_barrier_reflection"
         )
-        if self.incident_energy_ev < self.energy_cutoff_ev and np.any(bse_reflected):
+        if self.incident_energy_ev <= self.energy_cutoff_ev and np.any(bse_reflected):
             raise ValueError(
-                "incoming-barrier reflected primaries below the cutoff must be "
+                "incoming-barrier reflected primaries at/below the cutoff must be "
                 "stored in the SE energy class"
             )
-        if self.incident_energy_ev >= self.energy_cutoff_ev and np.any(se_reflected):
+        if self.incident_energy_ev > self.energy_cutoff_ev and np.any(se_reflected):
             raise ValueError(
-                "incoming-barrier reflected primaries at/above the cutoff must be "
+                "incoming-barrier reflected primaries above the cutoff must be "
                 "stored in the BSE energy class"
             )
 
@@ -449,7 +449,7 @@ def run_plane_sampler_case(
         barrier_reflection_probability = np.empty(0, dtype=float)
         primary_id = np.empty(0, dtype=np.int64)
 
-    is_se = emission_energy < config.bse_cutoff_ev
+    is_se = emission_energy <= config.bse_cutoff_ev
     se_ids = primary_id[is_se]
     bse_ids = primary_id[~is_se]
     if primary_id.size and (primary_id.min() < 0 or primary_id.max() >= n_primaries):
@@ -763,8 +763,8 @@ def export_angle_tables(directory, cases: Sequence[PlaneSamplerCase],
     temporary = readme.with_suffix(".txt.tmp")
     temporary.write_text(
         f"Planar {material} emission samplers at {angle_text} degrees incidence.\n"
-        f"SE means emitted energy < {cutoff:g} eV; BSE means emitted energy "
-        f">= {cutoff:g} eV.\n"
+        f"SE means emitted energy <= {cutoff:g} eV; BSE means emitted energy "
+        f"> {cutoff:g} eV.\n"
         "Theta is measured from the beam-back direction (opposite the incident "
         "vacuum ray), not from the sample normal.\n"
         f"Physical polar support is 0 to {90.0 + angle:g} degrees.\n"
@@ -947,8 +947,8 @@ def generate_plane_sampler_library(
             "trajectory_derivation": "SeedSequence([case_seed, 0, trajectory_id])",
         },
         "classification": {
-            "se": f"emission_energy_ev < {config.bse_cutoff_ev:g}",
-            "bse": f"emission_energy_ev >= {config.bse_cutoff_ev:g}",
+            "se": f"emission_energy_ev <= {config.bse_cutoff_ev:g}",
+            "bse": f"emission_energy_ev > {config.bse_cutoff_ev:g}",
         },
         "angle_convention": {
             "polar_axis": "beam-back direction (-incident vacuum direction)",
