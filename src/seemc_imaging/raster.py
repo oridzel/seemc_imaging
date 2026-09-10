@@ -1199,11 +1199,20 @@ def _geometry_metadata(geometry):
     for name in (
         "top_width", "bottom_width", "height", "center_x", "substrate_z",
         "membrane_thickness", "total_thickness", "bottom_z",
+        "pitch", "span",
         "surface_id", "solid_region", "vacuum_region",
     ):
         if hasattr(geometry, name):
             value = getattr(geometry, name)
-            metadata[name] = float(value) if isinstance(value, (int, float)) else str(value)
+            metadata[name] = (
+                float(value) if isinstance(value, (int, float)) else str(value)
+            )
+    if hasattr(geometry, "n_lines"):
+        metadata["n_lines"] = int(geometry.n_lines)
+    if hasattr(geometry, "line_centers"):
+        metadata["line_centers"] = [
+            float(value) for value in geometry.line_centers
+        ]
     if hasattr(geometry, "point"):
         metadata["point"] = [float(value) for value in geometry.point]
     if hasattr(geometry, "outward_normal"):
