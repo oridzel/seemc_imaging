@@ -1,4 +1,4 @@
-"""Animate a recorded one-row SEEMC raster over a trapezoidal line."""
+"""Animate a recorded one-row SEEMC raster over one or more trapezoidal lines."""
 
 from __future__ import annotations
 
@@ -31,10 +31,11 @@ def main():
     parser.add_argument("--title")
     parser.add_argument(
         "--profile-channels",
-        default="populations",
+        default="tey_se_bse",
         help=(
-            "lower-panel channels: populations (default), conventional, "
-            "tey_se_bse, or a comma-separated channel list"
+            "lower-panel channels: tey_se_bse (default: full SE, full BSE, "
+            "and total measured/TEY signal), populations, conventional, or "
+            "a comma-separated channel list"
         ),
     )
     args = parser.parse_args()
@@ -53,6 +54,13 @@ def main():
         parser.error("--vacuum-flight-nm must be non-negative")
 
     archive = RasterTrajectoryArchive.load_npz(args.trajectories)
+
+    # Default lower-panel view:
+    #   SE  = full cascade-born emitted-electron signal
+    #   BSE = full primary-return signal (LLE + non-LLE)
+    #   TEY = total measured emitted signal
+    #
+    # The animation backend exposes this grouping as "tey_se_bse".
     output = animate_trapezoidal_scan(
         archive,
         args.output,
