@@ -769,8 +769,8 @@ class Scene:
             # each primitive face as solid.  At a shallow ray/face angle, a
             # fixed displacement along the ray can remain inside that band on
             # both sides and make a real crossing look buried.  Scale the
-            # probe distance by the strongest crossing projection in this
-            # coincident group so the before/after samples leave the band.
+            # probe distance by the shallowest crossing projection in this
+            # coincident group so the before/after samples leave every band.
             crossing_projections = []
             for _, _, candidate in group:
                 projection = _dot(direction, candidate.outward_normal)
@@ -781,9 +781,15 @@ class Scene:
                 if valid:
                     crossing_projections.append(abs(projection))
             if crossing_projections:
+                # At coincident edges/corners, every participating face must
+                # be cleared before the before/after union samples are useful.
+                # The shallowest crossing (smallest |d.n|) therefore sets the
+                # required along-ray probe distance.  Using the strongest
+                # projection can leave the sample inside another primitive's
+                # tolerance band and incorrectly suppress a real boundary.
                 delta = max(
                     delta,
-                    self._sampling_offset(position) / max(crossing_projections),
+                    self._sampling_offset(position) / min(crossing_projections),
                 )
             if distance > 0.0:
                 delta = min(delta, 0.25 * distance)
