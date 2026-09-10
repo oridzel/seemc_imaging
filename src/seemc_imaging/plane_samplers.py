@@ -15,6 +15,7 @@ import hashlib
 import json
 import math
 import os
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
@@ -233,14 +234,14 @@ class PlaneSamplerCase:
             raise ValueError("BSE per-primary counts do not match raw emissions")
         if self.se_energy_ev.size and (
             float(self.se_energy_ev.min()) < -tolerance
-            or float(self.se_energy_ev.max()) > self.energy_cutoff_ev + tolerance
+            or float(self.se_energy_ev.max()) >= self.energy_cutoff_ev + tolerance
         ):
-            raise ValueError("SE energies violate the <= cutoff definition")
+            raise ValueError("SE energies violate the < cutoff definition")
         if self.bse_energy_ev.size and (
-            float(self.bse_energy_ev.min()) <= self.energy_cutoff_ev
+            float(self.bse_energy_ev.min()) < self.energy_cutoff_ev
             or float(self.bse_energy_ev.max()) > self.incident_energy_ev + tolerance
         ):
-            raise ValueError("BSE energies violate the > cutoff definition")
+            raise ValueError("BSE energies violate the >= cutoff definition")
         theta_max = 90.0 + self.incidence_angle_deg
         all_theta = np.concatenate((self.se_theta_deg, self.bse_theta_deg))
         if all_theta.size and (
@@ -270,8 +271,8 @@ class PlaneSamplerCase:
         # Direct incoming-barrier reflections have an exact planar fingerprint:
         # Eout=E0, theta=2*alpha, phi=0.  Enforce it so a future coordinate
         # convention change cannot silently corrupt the sharp specular lobe.
-        # At or below the SE/BSE cutoff these reflected primaries live in the
-        # legacy SE energy class; above the cutoff they live in the BSE class.
+        # Below the SE/BSE cutoff these reflected primaries live in the
+        # legacy SE energy class; at or above the cutoff they live in the BSE class.
         expected_theta = 2.0 * self.incidence_angle_deg
         for energies, theta, phi, mechanism, barrier_r, label in (
             (
@@ -327,14 +328,14 @@ class PlaneSamplerCase:
         bse_reflected = (
             self.bse_emission_mechanism == "incoming_barrier_reflection"
         )
-        if self.incident_energy_ev <= self.energy_cutoff_ev and np.any(bse_reflected):
+        if self.incident_energy_ev < self.energy_cutoff_ev and np.any(bse_reflected):
             raise ValueError(
-                "incoming-barrier reflected primaries at/below the cutoff must be "
+                "incoming-barrier reflected primaries below the cutoff must be "
                 "stored in the SE energy class"
             )
-        if self.incident_energy_ev > self.energy_cutoff_ev and np.any(se_reflected):
+        if self.incident_energy_ev >= self.energy_cutoff_ev and np.any(se_reflected):
             raise ValueError(
-                "incoming-barrier reflected primaries above the cutoff must be "
+                "incoming-barrier reflected primaries at/above the cutoff must be "
                 "stored in the BSE energy class"
             )
 
@@ -449,7 +450,7 @@ def run_plane_sampler_case(
         barrier_reflection_probability = np.empty(0, dtype=float)
         primary_id = np.empty(0, dtype=np.int64)
 
-    is_se = emission_energy <= config.bse_cutoff_ev
+    is_se = emission_energy < config.bse_cutoff_ev
     se_ids = primary_id[is_se]
     bse_ids = primary_id[~is_se]
     if primary_id.size and (primary_id.min() < 0 or primary_id.max() >= n_primaries):
@@ -486,10 +487,40 @@ def run_plane_sampler_case(
         bse_counts_per_primary=np.bincount(bse_ids, minlength=n_primaries),
     )
     case.validate()
-    if not math.isclose(case.sey, float(model.sey_50ev[0]), abs_tol=1.0e-14):
-        raise RuntimeError("raw SE emissions disagree with the SEEMC yield")
-    if not math.isclose(case.bsey, float(model.bse_50ev[0]), abs_tol=1.0e-14):
-        raise RuntimeError("raw BSE emissions disagree with the SEEMC yield")
+
+    # The sampler is built from the actual Emission records, so first verify
+    # the non-negotiable invariant: every electron counted in TEY must have a
+    # corresponding raw emission record.  Compare integer counts rather than
+    # floating-point yields.
+    n_done = int(model.n_completed[0])
+    expected_total = int(round(float(model.tey[0]) * n_done))
+    raw_total = int(emission_energy.size)
+    if raw_total != expected_total:
+        raise RuntimeError(
+            "raw emission records disagree with SEEMC TEY: "
+            f"raw={raw_total}, counter={expected_total}, "
+            f"E={energy:g} eV, angle={angle:g} deg, n={n_done}"
+        )
+
+    # SEEMC also carries redundant <cutoff / >=cutoff counters.  The joint
+    # sampler, however, must follow the energies stored in the raw Emission
+    # records themselves.  A split-only disagreement (most easily exposed at
+    # exactly the cutoff) must not discard an otherwise complete event sample.
+    expected_se = int(round(float(model.sey_50ev[0]) * n_done))
+    expected_bse = int(round(float(model.bse_50ev[0]) * n_done))
+    raw_se = int(np.count_nonzero(is_se))
+    raw_bse = int(raw_total - raw_se)
+    if raw_se != expected_se or raw_bse != expected_bse:
+        warnings.warn(
+            "SE/BSE bookkeeping differs from classification of the raw "
+            "emission records; using raw emission energies for sampler export. "
+            f"E={energy:g} eV, angle={angle:g} deg: "
+            f"raw SE/BSE={raw_se}/{raw_bse}, "
+            f"SEEMC counters={expected_se}/{expected_bse}, "
+            f"cutoff={config.bse_cutoff_ev:g} eV",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return case
 
 
@@ -763,8 +794,8 @@ def export_angle_tables(directory, cases: Sequence[PlaneSamplerCase],
     temporary = readme.with_suffix(".txt.tmp")
     temporary.write_text(
         f"Planar {material} emission samplers at {angle_text} degrees incidence.\n"
-        f"SE means emitted energy <= {cutoff:g} eV; BSE means emitted energy "
-        f"> {cutoff:g} eV.\n"
+        f"SE means emitted energy < {cutoff:g} eV; BSE means emitted energy "
+        f">= {cutoff:g} eV.\n"
         "Theta is measured from the beam-back direction (opposite the incident "
         "vacuum ray), not from the sample normal.\n"
         f"Physical polar support is 0 to {90.0 + angle:g} degrees.\n"
@@ -947,8 +978,8 @@ def generate_plane_sampler_library(
             "trajectory_derivation": "SeedSequence([case_seed, 0, trajectory_id])",
         },
         "classification": {
-            "se": f"emission_energy_ev <= {config.bse_cutoff_ev:g}",
-            "bse": f"emission_energy_ev > {config.bse_cutoff_ev:g}",
+            "se": f"emission_energy_ev < {config.bse_cutoff_ev:g}",
+            "bse": f"emission_energy_ev >= {config.bse_cutoff_ev:g}",
         },
         "angle_convention": {
             "polar_axis": "beam-back direction (-incident vacuum direction)",

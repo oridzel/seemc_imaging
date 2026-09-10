@@ -64,8 +64,8 @@ def case_payload_v2(*, emissions, incident_energy_ev, incidence_angle_deg,
     else:
         u=np.empty((0,3)); theta=phi=mb=mt=ms=outward=np.empty(0)
 
-    # Match transport exactly: <= cutoff is SE, > cutoff is BSE.
-    se=E <= float(energy_cutoff_ev); bse=~se
+    # Match transport exactly: < cutoff is SE, >= cutoff is BSE.
+    se=E < float(energy_cutoff_ev); bse=~se
     def cnt(mask):
         valid=ids[mask]
         valid=valid[(valid>=0)&(valid<int(n_primaries))]

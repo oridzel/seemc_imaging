@@ -1035,6 +1035,255 @@ class TrapezoidalLine:
 
 
 @dataclass(frozen=True)
+class TrapezoidalLineArray:
+    """Several parallel raised trapezoidal lines on one semi-infinite substrate.
+
+    The lines are infinite along global ``y`` and their centres are distributed
+    symmetrically about ``center_x`` with a constant centre-to-centre ``pitch``.
+
+    Coordinates follow the historical SEEMC convention used by
+    :class:`TrapezoidalLine`: vacuum is toward negative ``z`` and the substrate
+    occupies ``z >= substrate_z``.
+
+    ``n_lines=1`` is geometrically equivalent to :class:`TrapezoidalLine`.
+    For ``n_lines > 1`` the pitch must be at least ``bottom_width`` so adjacent
+    trapezoids do not overlap.
+    """
+
+    top_width: float
+    bottom_width: float
+    height: float
+    n_lines: int = 1
+    pitch: float = 1000.0
+    center_x: float = 0.0
+    substrate_z: float = 0.0
+    surface_id: str = "trapezoidal_lines"
+    solid_region: str = SOLID_REGION
+    vacuum_region: str = VACUUM_REGION
+    position_epsilon: float = 1e-9
+    prisms: tuple = field(init=False, repr=False)
+    substrate: Plane = field(init=False, repr=False)
+    scene: Scene = field(init=False, repr=False)
+    line_centers: tuple = field(init=False)
+
+    def __post_init__(self):
+        top_width = float(self.top_width)
+        bottom_width = float(self.bottom_width)
+        height = float(self.height)
+        pitch = float(self.pitch)
+        center_x = float(self.center_x)
+        substrate_z = float(self.substrate_z)
+        n_lines = int(self.n_lines)
+
+        if n_lines < 1:
+            raise ValueError("n_lines must be >= 1")
+        if not all(math.isfinite(value) for value in (
+                top_width, bottom_width, height, pitch, center_x, substrate_z)):
+            raise ValueError("line-array parameters must be finite")
+        if top_width <= 0.0 or bottom_width <= 0.0 or height <= 0.0:
+            raise ValueError("top_width, bottom_width, and height must be positive")
+        if bottom_width < top_width:
+            raise ValueError(
+                "bottom_width must be at least top_width; undercut lines are "
+                "not supported"
+            )
+        if n_lines > 1:
+            if pitch <= 0.0:
+                raise ValueError("pitch must be positive when n_lines > 1")
+            if pitch + self.position_epsilon < bottom_width:
+                raise ValueError(
+                    "pitch must be at least bottom_width so adjacent lines "
+                    "do not overlap"
+                )
+
+        offsets = tuple(
+            (index - 0.5 * (n_lines - 1)) * pitch
+            for index in range(n_lines)
+        )
+        centers = tuple(center_x + offset for offset in offsets)
+
+        prisms = tuple(
+            TrapezoidalPrism(
+                top_width=top_width,
+                bottom_width=bottom_width,
+                height=height,
+                center_x=line_center,
+                substrate_z=substrate_z,
+                surface_id=f"{self.surface_id}.line{index}",
+                solid_region=self.solid_region,
+                vacuum_region=self.vacuum_region,
+                boundary_tolerance=self.position_epsilon,
+            )
+            for index, line_center in enumerate(centers)
+        )
+
+        substrate = Plane(
+            point=(0.0, 0.0, substrate_z),
+            outward_normal=(0.0, 0.0, -1.0),
+            surface_id=f"{self.surface_id}.substrate",
+            solid_region=self.solid_region,
+            vacuum_region=self.vacuum_region,
+        )
+        scene = Scene(
+            (substrate, *prisms),
+            solid_region=self.solid_region,
+            vacuum_region=self.vacuum_region,
+            position_epsilon=self.position_epsilon,
+        )
+
+        object.__setattr__(self, "top_width", top_width)
+        object.__setattr__(self, "bottom_width", bottom_width)
+        object.__setattr__(self, "height", height)
+        object.__setattr__(self, "n_lines", n_lines)
+        object.__setattr__(self, "pitch", pitch)
+        object.__setattr__(self, "center_x", center_x)
+        object.__setattr__(self, "substrate_z", substrate_z)
+        object.__setattr__(self, "surface_id", str(self.surface_id))
+        object.__setattr__(self, "solid_region", str(self.solid_region))
+        object.__setattr__(self, "vacuum_region", str(self.vacuum_region))
+        object.__setattr__(self, "position_epsilon", float(self.position_epsilon))
+        object.__setattr__(self, "line_centers", centers)
+        object.__setattr__(self, "prisms", prisms)
+        object.__setattr__(self, "substrate", substrate)
+        object.__setattr__(self, "scene", scene)
+
+    @property
+    def top_z(self):
+        return self.substrate_z - self.height
+
+    @property
+    def point(self):
+        """Default launch point on the line nearest the array centre."""
+        index = (self.n_lines - 1) // 2
+        return (self.line_centers[index], 0.0, self.top_z)
+
+    @property
+    def outward_normal(self):
+        return (0.0, 0.0, -1.0)
+
+    @property
+    def span(self):
+        """Outer base-edge to outer base-edge span of the line array."""
+        return ((self.n_lines - 1) * self.pitch + self.bottom_width)
+
+    def region_at(self, point):
+        return self.scene.region_at(point)
+
+    def first_hit(self, origin, direction, max_distance, current_region):
+        return self.scene.first_hit(origin, direction, max_distance, current_region)
+
+    def surface_normal_at(self, point, incoming_direction=None):
+        return self.scene.surface_normal_at(point, incoming_direction)
+
+    def launch_surface(self, x, y=0.0, vacuum_direction=(0.0, 0.0, 1.0),
+                       clearance=None):
+        """Intersect a beam ray with the exposed multi-line/substrate surface."""
+        direction = _unit(vacuum_direction, "vacuum_direction")
+        if direction[2] <= self.scene.direction_epsilon:
+            raise ValueError("vacuum_direction must point toward increasing z")
+        if clearance is None:
+            clearance = max(
+                4.0 * self.height, self.span, self.bottom_width,
+                self.top_width, 1.0
+            ) / direction[2]
+        clearance = float(clearance)
+        if not math.isfinite(clearance) or clearance <= 0.0:
+            raise ValueError("clearance must be finite and positive")
+
+        reference = (float(x), float(y), self.top_z)
+        origin = tuple(
+            reference[index] - clearance * direction[index]
+            for index in range(3)
+        )
+        if self.region_at(origin) != self.vacuum_region:
+            raise RuntimeError("computed beam origin is not in vacuum")
+
+        max_distance = clearance + (
+            self.height + self.span + 1.0
+        ) / direction[2]
+        hit = self.first_hit(
+            origin, direction, max_distance, self.vacuum_region
+        )
+        if hit is None:
+            raise RuntimeError("beam ray did not intersect the specimen")
+        return hit
+
+    def surface_point(self, x, y=0.0, vacuum_direction=(0.0, 0.0, 1.0)):
+        return self.launch_surface(x, y, vacuum_direction).position
+
+    @staticmethod
+    def _segment_distance(px, pz, ax, az, bx, bz):
+        vx, vz = bx - ax, bz - az
+        wx, wz = px - ax, pz - az
+        vv = vx * vx + vz * vz
+        t = 0.0 if vv == 0.0 else max(
+            0.0, min(1.0, (wx * vx + wz * vz) / vv)
+        )
+        dx = px - (ax + t * vx)
+        dz = pz - (az + t * vz)
+        return math.hypot(dx, dz)
+
+    def _distance_to_exposed_substrate(self, x, z):
+        """Distance in the x-z section to the uncovered substrate surface."""
+        half_bottom = 0.5 * self.bottom_width
+        covered = tuple(
+            (center - half_bottom, center + half_bottom)
+            for center in self.line_centers
+        )
+
+        # Direct vertical projection lands on exposed substrate.
+        if not any(left <= x <= right for left, right in covered):
+            return abs(z - self.substrate_z)
+
+        # Projection is under a line base; nearest exposed substrate begins at
+        # one of the edges of a covered interval.
+        edge_distance = min(
+            min(abs(x - left), abs(x - right))
+            for left, right in covered
+        )
+        return math.hypot(edge_distance, z - self.substrate_z)
+
+    def depth_into_solid(self, point):
+        """Shortest cross-sectional distance to any exposed array boundary."""
+        point = _vec3(point, "point")
+        if self.region_at(point) != self.solid_region:
+            return 0.0
+
+        x = point[0]
+        z = point[2]
+        half_top = 0.5 * self.top_width
+        half_bottom = 0.5 * self.bottom_width
+        top_z = self.top_z
+        substrate_z = self.substrate_z
+
+        distances = [self._distance_to_exposed_substrate(x, z)]
+        for center in self.line_centers:
+            distances.extend([
+                self._segment_distance(
+                    x, z,
+                    center - half_top, top_z,
+                    center + half_top, top_z,
+                ),
+                self._segment_distance(
+                    x, z,
+                    center - half_bottom, substrate_z,
+                    center - half_top, top_z,
+                ),
+                self._segment_distance(
+                    x, z,
+                    center + half_top, top_z,
+                    center + half_bottom, substrate_z,
+                ),
+            ])
+        return min(distances)
+
+    def lateral_distance(self, point, reference):
+        point = _vec3(point, "point")
+        reference = _vec3(reference, "reference")
+        return math.hypot(point[0] - reference[0], point[1] - reference[1])
+
+
+@dataclass(frozen=True)
 class SuspendedTrapezoidalLine:
     """A trapezoidal line on a free-standing membrane of finite thickness.
 
@@ -1225,6 +1474,7 @@ __all__ = [
     "SurfaceHit",
     "SuspendedTrapezoidalLine",
     "TrapezoidalLine",
+    "TrapezoidalLineArray",
     "TrapezoidalPrism",
     "VACUUM_REGION",
 ]
