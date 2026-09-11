@@ -1199,20 +1199,11 @@ def _geometry_metadata(geometry):
     for name in (
         "top_width", "bottom_width", "height", "center_x", "substrate_z",
         "membrane_thickness", "total_thickness", "bottom_z",
-        "pitch", "span",
         "surface_id", "solid_region", "vacuum_region",
     ):
         if hasattr(geometry, name):
             value = getattr(geometry, name)
-            metadata[name] = (
-                float(value) if isinstance(value, (int, float)) else str(value)
-            )
-    if hasattr(geometry, "n_lines"):
-        metadata["n_lines"] = int(geometry.n_lines)
-    if hasattr(geometry, "line_centers"):
-        metadata["line_centers"] = [
-            float(value) for value in geometry.line_centers
-        ]
+            metadata[name] = float(value) if isinstance(value, (int, float)) else str(value)
     if hasattr(geometry, "point"):
         metadata["point"] = [float(value) for value in geometry.point]
     if hasattr(geometry, "outward_normal"):
@@ -1288,13 +1279,51 @@ def _simulate_pixel(sample, geometry, config, classifier, task):
             for electron_id, coordinates, times_fs in zip(
                 result.track_electron_ids, result.tracks, result.track_times_fs
             ):
-                record = records_by_id[electron_id]
-                population = labels.get(
-                    electron_id,
-                    "primary_absorbed" if record.is_primary else "cascade_absorbed",
-                )
+                # Normal transport uses history-local electron IDs consistently.
+                # The incoming-barrier-reflection fast path in older transport.py
+                # versions is the exception: it labels the stored track/emission
+                # with trajectory_id, while _HistoryRecorder registers the same
+                # reflected primary as local electron_id == 0.  Reconcile that
+                # known bookkeeping mismatch here so old transport versions can
+                # still produce valid animation archives.
+                track_electron_id = int(electron_id)
+                record = records_by_id.get(track_electron_id)
+                archive_electron_id = track_electron_id
+
+                if record is None:
+                    roots = [
+                        item for item in result.history.electrons
+                        if item.parent_id is None
+                    ]
+                    barrier_reflection_compat = (
+                        len(result.track_electron_ids) == 1
+                        and len(result.history.electrons) == 1
+                        and len(roots) == 1
+                        and bool(roots[0].is_primary)
+                        and getattr(roots[0], "fate", None) == "emitted"
+                    )
+                    if not barrier_reflection_compat:
+                        raise RuntimeError(
+                            "trajectory track/history electron-ID mismatch: "
+                            f"track electron_id={track_electron_id}, "
+                            f"history IDs={sorted(records_by_id)}"
+                        )
+                    record = roots[0]
+                    archive_electron_id = int(record.electron_id)
+
+                # For the compatibility case the classifier labels are keyed by
+                # the old track/emission ID, so try that first.  The archive
+                # itself uses the history-local ID so ancestry remains coherent.
+                population = labels.get(track_electron_id)
+                if population is None:
+                    population = labels.get(
+                        archive_electron_id,
+                        "primary_absorbed"
+                        if record.is_primary else "cascade_absorbed",
+                    )
+
                 electrons.append({
-                    "electron_id": int(electron_id),
+                    "electron_id": archive_electron_id,
                     "parent_id": record.parent_id,
                     "generation": int(record.generation),
                     "is_primary": bool(record.is_primary),
