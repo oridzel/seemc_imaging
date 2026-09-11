@@ -1,4 +1,4 @@
-"""Animation of a recorded one-dimensional SEM scan over a trapezoidal line."""
+"""Animation of a recorded one-dimensional SEM scan over one or more trapezoidal lines."""
 
 from __future__ import annotations
 
@@ -140,21 +140,54 @@ def _display_track(archive, electron_index, vacuum_flight_nm):
     return points
 
 
-_ANIMATABLE_GEOMETRIES = ("TrapezoidalLine", "SuspendedTrapezoidalLine")
+_ANIMATABLE_GEOMETRIES = (
+    "TrapezoidalLine",
+    "SuspendedTrapezoidalLine",
+    "TrapezoidalLineArray",
+)
 
 
 def _geometry_values(archive):
     geometry = archive.metadata.get("geometry", {})
-    if geometry.get("type") not in _ANIMATABLE_GEOMETRIES:
+    geometry_type = geometry.get("type")
+    if geometry_type not in _ANIMATABLE_GEOMETRIES:
         raise ValueError(
             "trapezoidal scan animation requires one of "
             f"{_ANIMATABLE_GEOMETRIES} in the archive geometry metadata"
         )
-    required = ("top_width", "bottom_width", "height", "center_x", "substrate_z")
+
+    required = ("top_width", "bottom_width", "height", "substrate_z")
     missing = [name for name in required if name not in geometry]
     if missing:
         raise ValueError(f"trajectory archive is missing geometry values: {missing}")
+
     values = {name: float(geometry[name]) / 10.0 for name in required}
+    values["type"] = geometry_type
+
+    # Single-line archives historically store center_x.  Multi-line archives
+    # store n_lines / pitch / line_centers; center_x may be absent.
+    if "line_centers" in geometry:
+        line_centers = [float(value) / 10.0 for value in geometry["line_centers"]]
+    elif "center_x" in geometry:
+        line_centers = [float(geometry["center_x"]) / 10.0]
+    else:
+        raise ValueError(
+            "trajectory archive is missing geometry values: "
+            "need line_centers or center_x"
+        )
+    if not line_centers:
+        raise ValueError("trajectory archive contains an empty line_centers list")
+
+    values["line_centers"] = line_centers
+    values["center_x"] = float(np.mean(line_centers))
+    values["n_lines"] = int(geometry.get("n_lines", len(line_centers)))
+    values["pitch"] = (
+        None if geometry.get("pitch") is None else float(geometry["pitch"]) / 10.0
+    )
+    values["span"] = (
+        None if geometry.get("span") is None else float(geometry["span"]) / 10.0
+    )
+
     # A suspended membrane has a finite underside; a bulk substrate does not.
     thickness = geometry.get("membrane_thickness")
     values["membrane_thickness"] = (
@@ -164,18 +197,32 @@ def _geometry_values(archive):
 
 
 def _trapezoid_surface_height_nm(
-        x_nm, *, top_width, bottom_width, height, center_x,
+        x_nm, *, top_width, bottom_width, height, line_centers,
         substrate_height):
-    """Return the nominal normal-incidence beam intersection height."""
-    distance = abs(float(x_nm) - float(center_x))
-    half_top = 0.5 * float(top_width)
-    half_bottom = 0.5 * float(bottom_width)
-    if distance <= half_top:
-        return float(substrate_height) + float(height)
-    if distance >= half_bottom or half_bottom <= half_top:
-        return float(substrate_height)
-    side_fraction = (half_bottom - distance) / (half_bottom - half_top)
-    return float(substrate_height) + float(height) * side_fraction
+    """Return the nominal normal-incidence beam intersection height.
+
+    For a line array, return the highest intersection among all trapezoids.
+    With non-overlapping lines this is simply the one feature, if any, under
+    the beam x-position; elsewhere it is the substrate height.
+    """
+    x_nm = float(x_nm)
+    top_width = float(top_width)
+    bottom_width = float(bottom_width)
+    height = float(height)
+    substrate_height = float(substrate_height)
+    half_top = 0.5 * top_width
+    half_bottom = 0.5 * bottom_width
+
+    surface_height = substrate_height
+    for center_x in line_centers:
+        distance = abs(x_nm - float(center_x))
+        if distance <= half_top:
+            return substrate_height + height
+        if distance >= half_bottom or half_bottom <= half_top:
+            continue
+        side_fraction = (half_bottom - distance) / (half_bottom - half_top)
+        surface_height = max(surface_height, substrate_height + height * side_fraction)
+    return surface_height
 
 
 def animate_trapezoidal_scan(
@@ -258,6 +305,7 @@ def animate_trapezoidal_scan(
     top_width = geometry["top_width"]
     bottom_width = geometry["bottom_width"]
     height = geometry["height"]
+    line_centers = tuple(float(value) for value in geometry["line_centers"])
     center_x = geometry["center_x"]
     substrate_height = -geometry["substrate_z"]
     x_nm = archive.x_angstrom / 10.0
@@ -327,17 +375,18 @@ def animate_trapezoidal_scan(
             facecolor="#263548", edgecolor="#9fb3c8", linewidth=1.0, zorder=0,
         )
     axis.add_patch(support)
-    trapezoid = Polygon(
-        [
-            (center_x - bottom_width / 2.0, substrate_height),
-            (center_x - top_width / 2.0, substrate_height + height),
-            (center_x + top_width / 2.0, substrate_height + height),
-            (center_x + bottom_width / 2.0, substrate_height),
-        ],
-        closed=True, facecolor="#344b66", edgecolor="#9fb3c8",
-        linewidth=1.4, zorder=1,
-    )
-    axis.add_patch(trapezoid)
+    for center in line_centers:
+        trapezoid = Polygon(
+            [
+                (center - bottom_width / 2.0, substrate_height),
+                (center - top_width / 2.0, substrate_height + height),
+                (center + top_width / 2.0, substrate_height + height),
+                (center + bottom_width / 2.0, substrate_height),
+            ],
+            closed=True, facecolor="#344b66", edgecolor="#9fb3c8",
+            linewidth=1.4, zorder=1,
+        )
+        axis.add_patch(trapezoid)
     axis.axhline(substrate_height, color="#9fb3c8", linewidth=1.0, zorder=1)
 
     beam_line, = axis.plot([], [], color="#59e1ff", linewidth=2.1,
@@ -454,7 +503,7 @@ def animate_trapezoidal_scan(
             top_width=top_width,
             bottom_width=bottom_width,
             height=height,
-            center_x=center_x,
+            line_centers=line_centers,
             substrate_height=substrate_height,
         )
         beam_top = axis.get_ylim()[1]
