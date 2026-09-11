@@ -48,7 +48,9 @@ POPULATION_COLORS = {
 # also holds primaries emitted below the 50 eV cut, which the conventional
 # partition counts as SEs rather than BSEs.
 PROFILE_STYLES = {
-    "tey": ("TEY", "#f8fafc"),
+    "tey": ("Total measured signal", "#f8fafc"),
+    "cascade_all": ("Full SE", "#39d98a"),
+    "primary_all": ("Full BSE", "#43aaef"),
     "sey_50ev": ("SE, E < 50 eV", "#39d98a"),
     "bse_50ev": ("BSE, E ≥ 50 eV", "#43aaef"),
     "se1": ("SE1 (all E)", "#39d98a"),
@@ -164,31 +166,38 @@ def _geometry_values(archive):
     values = {name: float(geometry[name]) / 10.0 for name in required}
     values["type"] = geometry_type
 
-    # Single-line archives historically store center_x.  Multi-line archives
-    # store n_lines / pitch / line_centers; center_x may be absent.
     if "line_centers" in geometry:
-        line_centers = [float(value) / 10.0 for value in geometry["line_centers"]]
+        centers = [float(value) / 10.0 for value in geometry["line_centers"]]
+    elif geometry_type == "TrapezoidalLineArray":
+        n_lines = int(geometry.get("n_lines", 1))
+        pitch_angstrom = geometry.get("pitch")
+        if n_lines > 1 and pitch_angstrom is None:
+            raise ValueError(
+                "TrapezoidalLineArray metadata needs line_centers or pitch"
+            )
+        pitch_nm = 0.0 if pitch_angstrom is None else float(pitch_angstrom) / 10.0
+        center_nm = float(geometry.get("center_x", 0.0)) / 10.0
+        centers = [
+            center_nm + (index - 0.5 * (n_lines - 1)) * pitch_nm
+            for index in range(n_lines)
+        ]
     elif "center_x" in geometry:
-        line_centers = [float(geometry["center_x"]) / 10.0]
+        centers = [float(geometry["center_x"]) / 10.0]
     else:
         raise ValueError(
-            "trajectory archive is missing geometry values: "
-            "need line_centers or center_x"
+            "trajectory archive is missing line_centers/center_x geometry metadata"
         )
-    if not line_centers:
-        raise ValueError("trajectory archive contains an empty line_centers list")
 
-    values["line_centers"] = line_centers
-    values["center_x"] = float(np.mean(line_centers))
-    values["n_lines"] = int(geometry.get("n_lines", len(line_centers)))
-    values["pitch"] = (
-        None if geometry.get("pitch") is None else float(geometry["pitch"]) / 10.0
-    )
-    values["span"] = (
-        None if geometry.get("span") is None else float(geometry["span"]) / 10.0
-    )
+    if not centers:
+        raise ValueError("geometry metadata contains no trapezoidal line centers")
 
-    # A suspended membrane has a finite underside; a bulk substrate does not.
+    values["line_centers"] = tuple(centers)
+    values["center_x"] = float(np.mean(centers))
+    values["n_lines"] = len(centers)
+
+    pitch = geometry.get("pitch")
+    values["pitch"] = None if pitch is None else float(pitch) / 10.0
+
     thickness = geometry.get("membrane_thickness")
     values["membrane_thickness"] = (
         None if thickness is None else float(thickness) / 10.0
@@ -199,12 +208,7 @@ def _geometry_values(archive):
 def _trapezoid_surface_height_nm(
         x_nm, *, top_width, bottom_width, height, line_centers,
         substrate_height):
-    """Return the nominal normal-incidence beam intersection height.
-
-    For a line array, return the highest intersection among all trapezoids.
-    With non-overlapping lines this is simply the one feature, if any, under
-    the beam x-position; elsewhere it is the substrate height.
-    """
+    """Return the nominal normal-incidence beam intersection height."""
     x_nm = float(x_nm)
     top_width = float(top_width)
     bottom_width = float(bottom_width)
@@ -221,7 +225,10 @@ def _trapezoid_surface_height_nm(
         if distance >= half_bottom or half_bottom <= half_top:
             continue
         side_fraction = (half_bottom - distance) / (half_bottom - half_top)
-        surface_height = max(surface_height, substrate_height + height * side_fraction)
+        surface_height = max(
+            surface_height,
+            substrate_height + height * side_fraction,
+        )
     return surface_height
 
 
@@ -305,7 +312,7 @@ def animate_trapezoidal_scan(
     top_width = geometry["top_width"]
     bottom_width = geometry["bottom_width"]
     height = geometry["height"]
-    line_centers = tuple(float(value) for value in geometry["line_centers"])
+    line_centers = geometry["line_centers"]
     center_x = geometry["center_x"]
     substrate_height = -geometry["substrate_z"]
     x_nm = archive.x_angstrom / 10.0
@@ -375,13 +382,13 @@ def animate_trapezoidal_scan(
             facecolor="#263548", edgecolor="#9fb3c8", linewidth=1.0, zorder=0,
         )
     axis.add_patch(support)
-    for center in line_centers:
+    for line_center in line_centers:
         trapezoid = Polygon(
             [
-                (center - bottom_width / 2.0, substrate_height),
-                (center - top_width / 2.0, substrate_height + height),
-                (center + top_width / 2.0, substrate_height + height),
-                (center + bottom_width / 2.0, substrate_height),
+                (line_center - bottom_width / 2.0, substrate_height),
+                (line_center - top_width / 2.0, substrate_height + height),
+                (line_center + top_width / 2.0, substrate_height + height),
+                (line_center + bottom_width / 2.0, substrate_height),
             ],
             closed=True, facecolor="#344b66", edgecolor="#9fb3c8",
             linewidth=1.4, zorder=1,
