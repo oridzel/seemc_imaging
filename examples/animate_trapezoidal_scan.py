@@ -30,6 +30,23 @@ def main():
     parser.add_argument("--dpi", type=int, default=150)
     parser.add_argument("--title")
     parser.add_argument(
+        "--n-lines", type=int,
+        help=(
+            "display override for number of trapezoidal lines; useful for older "
+            "trajectory archives that lack line-array metadata"
+        ),
+    )
+    parser.add_argument(
+        "--pitch-nm", type=float,
+        help="display override for center-to-center line pitch in nm",
+    )
+    parser.add_argument(
+        "--line-centers-nm",
+        type=float,
+        nargs="+",
+        help="explicit display line centers in nm, e.g. -100 0 100",
+    )
+    parser.add_argument(
         "--profile-channels",
         default="cascade_all,primary_all,tey",
         help=(
@@ -52,6 +69,10 @@ def main():
         parser.error("--tail-fraction must lie in (0, 1]")
     if args.vacuum_flight_nm < 0.0:
         parser.error("--vacuum-flight-nm must be non-negative")
+    if args.n_lines is not None and args.n_lines < 1:
+        parser.error("--n-lines must be >=1")
+    if args.pitch_nm is not None and args.pitch_nm <= 0.0:
+        parser.error("--pitch-nm must be positive")
 
     archive = RasterTrajectoryArchive.load_npz(args.trajectories)
     output = animate_trapezoidal_scan(
@@ -67,6 +88,9 @@ def main():
         dpi=args.dpi,
         title=args.title,
         profile_channels=args.profile_channels,
+        n_lines=args.n_lines,
+        pitch_nm=args.pitch_nm,
+        line_centers_nm=args.line_centers_nm,
     )
     duration = (
         len(np.unique(archive.cascade_pixel_id)[::args.pixel_stride])

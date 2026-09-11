@@ -236,7 +236,8 @@ def animate_trapezoidal_scan(
         archive, output, *, fps=30, frames_per_pixel=16, pause_frames=4,
         pixel_stride=1, color_by="energy", tail_fraction=0.45,
         vacuum_flight_nm=35.0, dpi=150, title=None,
-        profile_channels="populations"):
+        profile_channels="populations", n_lines=None, pitch_nm=None,
+        line_centers_nm=None):
     """Render an MP4 or GIF from a :class:`RasterTrajectoryArchive`.
 
     Physical femtosecond timing is preserved within each independently
@@ -312,8 +313,44 @@ def animate_trapezoidal_scan(
     top_width = geometry["top_width"]
     bottom_width = geometry["bottom_width"]
     height = geometry["height"]
-    line_centers = geometry["line_centers"]
+    line_centers = tuple(geometry["line_centers"])
     center_x = geometry["center_x"]
+
+    # Optional display-only geometry overrides.  These are useful for older
+    # trajectory archives created before line-array metadata (n_lines/pitch/
+    # line_centers) was stored.  They do not alter any trajectory data.
+    if line_centers_nm is not None:
+        line_centers = tuple(float(value) for value in line_centers_nm)
+        if not line_centers:
+            raise ValueError("line_centers_nm must contain at least one value")
+        center_x = float(np.mean(line_centers))
+    elif n_lines is not None or pitch_nm is not None:
+        display_n_lines = int(
+            n_lines if n_lines is not None else geometry.get("n_lines", len(line_centers))
+        )
+        if display_n_lines < 1:
+            raise ValueError("n_lines must be at least 1")
+        if display_n_lines == 1:
+            line_centers = (float(center_x),)
+        else:
+            if pitch_nm is None:
+                stored_pitch = geometry.get("pitch")
+                if stored_pitch is None:
+                    raise ValueError(
+                        "pitch_nm is required when overriding a multi-line geometry "
+                        "whose archive does not contain pitch metadata"
+                    )
+                display_pitch_nm = float(stored_pitch)
+            else:
+                display_pitch_nm = float(pitch_nm)
+            if display_pitch_nm <= 0.0:
+                raise ValueError("pitch_nm must be positive")
+            line_centers = tuple(
+                float(center_x)
+                + (index - 0.5 * (display_n_lines - 1)) * display_pitch_nm
+                for index in range(display_n_lines)
+            )
+
     substrate_height = -geometry["substrate_z"]
     x_nm = archive.x_angstrom / 10.0
 
@@ -367,19 +404,21 @@ def animate_trapezoidal_scan(
     axis.tick_params(labelbottom=False)
     axis.grid(color="#334155", alpha=0.18, linewidth=0.7)
 
+    specimen_color = "#344b66"
+
     if membrane_thickness is None:
         support = Rectangle(
             (x_nm[0] - 2.0 * x_margin, axis.get_ylim()[0]),
             x_nm[-1] - x_nm[0] + 4.0 * x_margin,
             substrate_height - axis.get_ylim()[0],
-            facecolor="#263548", edgecolor="none", zorder=0,
+            facecolor=specimen_color, edgecolor="none", zorder=0,
         )
     else:
         support = Rectangle(
             (x_nm[0] - 2.0 * x_margin, substrate_height - membrane_thickness),
             x_nm[-1] - x_nm[0] + 4.0 * x_margin,
             membrane_thickness,
-            facecolor="#263548", edgecolor="#9fb3c8", linewidth=1.0, zorder=0,
+            facecolor=specimen_color, edgecolor="none", linewidth=0.0, zorder=0,
         )
     axis.add_patch(support)
     for line_center in line_centers:
@@ -390,11 +429,10 @@ def animate_trapezoidal_scan(
                 (line_center + top_width / 2.0, substrate_height + height),
                 (line_center + bottom_width / 2.0, substrate_height),
             ],
-            closed=True, facecolor="#344b66", edgecolor="#9fb3c8",
-            linewidth=1.4, zorder=1,
+            closed=True, facecolor=specimen_color, edgecolor="none",
+            linewidth=0.0, zorder=1,
         )
         axis.add_patch(trapezoid)
-    axis.axhline(substrate_height, color="#9fb3c8", linewidth=1.0, zorder=1)
 
     beam_line, = axis.plot([], [], color="#59e1ff", linewidth=2.1,
                            alpha=0.9, zorder=4)
