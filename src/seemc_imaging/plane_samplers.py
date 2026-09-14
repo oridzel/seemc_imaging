@@ -19,6 +19,7 @@ import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -49,7 +50,7 @@ BSE_ENERGY_FILENAME = "BSEeEFromPlaneSampler_SEVaccum_t0nmCuFPA.csv"
 SE_THETA_FILENAME = "SEThetaFromPlaneSampler_uncoatedCuFPA.csv"
 BSE_THETA_FILENAME = "BSEThetaFromPlaneSampler_uncoatedCuFPA.csv"
 
-CHECKPOINT_SCHEMA = "seemc-plane-sampler-case-v3"
+CHECKPOINT_SCHEMA = "seemc-plane-sampler-case-v4"
 PACKAGE_VERSION = "0.7.5"
 
 
@@ -128,6 +129,16 @@ class PlaneSamplerCase:
     se_barrier_reflection_probability: np.ndarray
     bse_barrier_reflection_probability: np.ndarray
 
+    # Exact raster PopulationClassifier labels/provenance.  The labels are the
+    # disjoint causal_lle_v3 basis, not an independently reimplemented rule.
+    se_population_label: np.ndarray
+    bse_population_label: np.ndarray
+    se_generation: np.ndarray
+    bse_generation: np.ndarray
+    se_is_cascade: np.ndarray
+    bse_is_cascade: np.ndarray
+    population_classifier_json: str
+
     se_primary_id: np.ndarray
     bse_primary_id: np.ndarray
     se_counts_per_primary: np.ndarray
@@ -181,6 +192,7 @@ class PlaneSamplerCase:
                 self.se_mu_toward_normal, self.se_mu_side,
                 self.se_emission_mechanism,
                 self.se_barrier_reflection_probability,
+                self.se_population_label, self.se_generation, self.se_is_cascade,
                 self.se_primary_id, "SE",
             ),
             (
@@ -189,16 +201,19 @@ class PlaneSamplerCase:
                 self.bse_mu_toward_normal, self.bse_mu_side,
                 self.bse_emission_mechanism,
                 self.bse_barrier_reflection_probability,
+                self.bse_population_label, self.bse_generation, self.bse_is_cascade,
                 self.bse_primary_id, "BSE",
             ),
         )
         for (
             energies, theta, phi, directions, positions, mu_b, mu_t, mu_s,
-            mechanism, barrier_r, primary_ids, label
+            mechanism, barrier_r, population_label, generation, is_cascade,
+            primary_ids, label
         ) in pairs:
             one_d = (
                 energies, theta, phi, mu_b, mu_t, mu_s,
-                mechanism, barrier_r, primary_ids,
+                mechanism, barrier_r, population_label, generation, is_cascade,
+                primary_ids,
             )
             if any(array.ndim != 1 for array in one_d):
                 raise ValueError(f"{label} scalar raw arrays must be one-dimensional")
@@ -223,6 +238,17 @@ class PlaneSamplerCase:
                 or int(primary_ids.max()) >= self.n_primaries
             ):
                 raise ValueError(f"{label} primary IDs are outside the case range")
+            allowed_population_labels = {
+                "se1_lt50", "se1_ge50", "se2_lt50", "se2_ge50",
+                "lle_primary", "non_lle_primary",
+            }
+            if population_label.size and not set(population_label.tolist()).issubset(
+                allowed_population_labels
+            ):
+                unknown = sorted(set(population_label.tolist()) - allowed_population_labels)
+                raise ValueError(f"{label} contains unknown population labels: {unknown}")
+            if generation.size and np.any(generation < 0):
+                raise ValueError(f"{label} generation values must be non-negative")
 
             if n:
                 norms = np.linalg.norm(directions, axis=1)
@@ -363,6 +389,103 @@ def _file_sha256(path) -> str:
     return digest.hexdigest()
 
 
+def _history_escape_event(history, electron_id):
+    """Return the terminal escape/reflection event for one emitted electron."""
+    candidates = [
+        event for event in history.events
+        if event.electron_id == electron_id
+        and event.kind in {"surface", "surface_crossing", "incoming_barrier_reflection"}
+    ]
+    if not candidates:
+        return None
+    reflected = [e for e in candidates if e.kind == "incoming_barrier_reflection"]
+    if reflected:
+        return reflected[-1]
+    # The last surface event is the terminal escape for an emitted record.
+    return candidates[-1]
+
+
+def _emissions_from_histories(histories, classifier):
+    """Reconstruct emitted events and apply raster.PopulationClassifier exactly.
+
+    SEEMC history electron IDs are local to each trajectory.  Therefore the
+    checkpoint primary ID is taken from ``history.trajectory_id`` rather than
+    from ``Emission.root_primary_id``.  This remains valid in serial and
+    multiprocessing runs.
+    """
+    energy = []
+    direction = []
+    xyz = []
+    primary_id = []
+    mechanism = []
+    barrier_r = []
+    population_label = []
+    generation = []
+    is_cascade = []
+
+    for history in sorted(
+        histories, key=lambda h: (-1 if h.trajectory_id is None else h.trajectory_id)
+    ):
+        trajectory_id = history.trajectory_id
+        if trajectory_id is None:
+            raise RuntimeError("population-resolved plane sampler requires trajectory IDs")
+
+        emitted_records = [r for r in history.electrons if r.fate == "emitted"]
+        classifier_emissions = []
+        escape_events = {}
+        for record in emitted_records:
+            event = _history_escape_event(history, record.electron_id)
+            escape_events[record.electron_id] = event
+            surface_normal = None if event is None else getattr(event, "surface_normal", None)
+            classifier_emissions.append(SimpleNamespace(
+                energy=float(record.final_energy),
+                is_cascade=not bool(record.is_primary),
+                generation=int(record.generation),
+                electron_id=int(record.electron_id),
+                surface_normal=surface_normal,
+            ))
+
+        result = SimpleNamespace(
+            history=history, emissions=classifier_emissions, tey=len(classifier_emissions)
+        )
+        labels = classifier.emission_labels(result)
+
+        for record in emitted_records:
+            if record.final_position is None or record.final_direction is None \
+                    or record.final_energy is None:
+                raise RuntimeError("emitted history record lacks final phase-space data")
+            eid = int(record.electron_id)
+            event = escape_events[eid]
+            is_barrier = event is not None and event.kind == "incoming_barrier_reflection"
+            reflection_probability = np.nan
+            if is_barrier:
+                metadata = getattr(event, "metadata", None) or {}
+                value = metadata.get("reflection_probability", np.nan)
+                reflection_probability = float(value)
+
+            energy.append(float(record.final_energy))
+            direction.append(tuple(float(v) for v in record.final_direction))
+            xyz.append(tuple(float(v) for v in record.final_position))
+            primary_id.append(int(trajectory_id))
+            mechanism.append("incoming_barrier_reflection" if is_barrier else "transport_escape")
+            barrier_r.append(reflection_probability)
+            population_label.append(str(labels[eid]))
+            generation.append(int(record.generation))
+            is_cascade.append(not bool(record.is_primary))
+
+    return (
+        np.asarray(energy, dtype=float),
+        np.asarray(direction, dtype=float).reshape((-1, 3)),
+        np.asarray(xyz, dtype=float).reshape((-1, 3)),
+        np.asarray(primary_id, dtype=np.int64),
+        np.asarray(mechanism, dtype=str),
+        np.asarray(barrier_r, dtype=float),
+        np.asarray(population_label, dtype=str),
+        np.asarray(generation, dtype=np.int64),
+        np.asarray(is_cascade, dtype=bool),
+    )
+
+
 def run_plane_sampler_case(
     database_path,
     material: str,
@@ -375,7 +498,10 @@ def run_plane_sampler_case(
     workers: int = 1,
     progress: bool = True,
 ) -> PlaneSamplerCase:
-    """Run one planar case and retain the raw emissions needed for a sampler."""
+    """Run one planar case with the exact raster population definitions."""
+    # Local import avoids making plane sampler import order depend on raster.
+    from .raster import PopulationClassifier
+
     config = config or MCConfig()
     config.validate()
     if not config.collect_spectra:
@@ -389,10 +515,14 @@ def run_plane_sampler_case(
         raise ValueError("incident energy must be finite and positive")
     vacuum, outward, beam_back = plane_directions(angle)
 
+    # This is intentionally the same default classifier used by RasterConfig:
+    # causal_lle_v3, launch_surface, root_primary_leg, absolute 50 eV LLE loss.
+    classifier = PopulationClassifier(bse_cutoff_ev=float(config.bse_cutoff_ev))
+
     model = SEEMC(
         [energy], material, math.radians(angle), n_primaries,
         db_path=str(database_path), config=config, seed=int(case_seed),
-        history=False, geometry=Plane(), vacuum_direction=vacuum,
+        history=True, geometry=Plane(), vacuum_direction=vacuum,
         surface_normal=outward,
     ).run_simulation(
         use_parallel=int(workers) > 1,
@@ -401,149 +531,106 @@ def run_plane_sampler_case(
         verbose=False,
     )
 
-    emissions = model.emissions[0]
-    if emissions:
-        emission_energy = np.asarray(
-            [item.energy for item in emissions], dtype=float
-        )
-        emission_direction = np.asarray(
-            [item.uvw for item in emissions], dtype=float
-        )
-        # ``Emission.xyz`` is the position at which the electron is recorded
-        # as emitted from the solid. Keep it paired event-by-event with energy,
-        # direction, mechanism, and root primary ID for PSF analysis.
-        if any(getattr(item, "xyz", None) is None for item in emissions):
-            raise RuntimeError(
-                "raw Emission records do not contain xyz positions; "
-                "PSF export requires transport Emission.xyz support"
-            )
-        emission_xyz = np.asarray(
-            [item.xyz for item in emissions], dtype=float
-        )
-        primary_id = np.asarray(
-            [item.root_primary_id for item in emissions], dtype=np.int64
-        )
+    (
+        emission_energy, emission_direction, emission_xyz, primary_id,
+        emission_mechanism, barrier_reflection_probability, population_label,
+        emission_generation, emission_is_cascade,
+    ) = _emissions_from_histories(model.histories[0], classifier)
+
+    if emission_direction.size:
         (
-            emission_direction,
-            theta_deg,
-            phi_deg,
-            mu_beam_back,
-            mu_toward_normal,
-            mu_side,
-            outward_cosine,
+            emission_direction, theta_deg, phi_deg, mu_beam_back,
+            mu_toward_normal, mu_side, outward_cosine,
         ) = direction_angles(
             emission_direction,
             vacuum_incident_direction=vacuum,
             surface_normal_out=outward,
         )
         if np.any(outward_cosine <= -1.0e-12):
-            raise ValueError(
-                "transport returned an electron directed into the sample"
-            )
-        emission_mechanism = np.asarray(
-            [
-                str(getattr(item, "emission_mechanism", "transport_escape"))
-                for item in emissions
-            ]
-        )
-        barrier_reflection_probability = np.asarray(
-            [
-                np.nan
-                if getattr(item, "barrier_reflection_probability", None) is None
-                else float(item.barrier_reflection_probability)
-                for item in emissions
-            ],
-            dtype=float,
-        )
+            raise ValueError("transport returned an electron directed into the sample")
     else:
-        emission_energy = np.empty(0, dtype=float)
-        emission_direction = np.empty((0, 3), dtype=float)
-        emission_xyz = np.empty((0, 3), dtype=float)
         theta_deg = np.empty(0, dtype=float)
         phi_deg = np.empty(0, dtype=float)
         mu_beam_back = np.empty(0, dtype=float)
         mu_toward_normal = np.empty(0, dtype=float)
         mu_side = np.empty(0, dtype=float)
-        outward_cosine = np.empty(0, dtype=float)
-        emission_mechanism = np.empty(0, dtype="<U1")
-        barrier_reflection_probability = np.empty(0, dtype=float)
-        primary_id = np.empty(0, dtype=np.int64)
 
     is_se = emission_energy < config.bse_cutoff_ev
     se_ids = primary_id[is_se]
     bse_ids = primary_id[~is_se]
     if primary_id.size and (primary_id.min() < 0 or primary_id.max() >= n_primaries):
-        raise RuntimeError(
-            "emissions lack valid per-primary IDs; use seemc-imaging 0.7.4 or newer"
-        )
+        raise RuntimeError("history trajectory IDs are outside the requested primary range")
+
+    classifier_json = json.dumps(
+        classifier.to_dict(), sort_keys=True, separators=(",", ":")
+    )
     case = PlaneSamplerCase(
-        incidence_angle_deg=angle,
-        incident_energy_ev=energy,
-        n_primaries=n_primaries,
-        case_seed=int(case_seed),
+        incidence_angle_deg=angle, incident_energy_ev=energy,
+        n_primaries=n_primaries, case_seed=int(case_seed),
         energy_cutoff_ev=float(config.bse_cutoff_ev),
-        se_energy_ev=emission_energy[is_se],
-        bse_energy_ev=emission_energy[~is_se],
-        se_theta_deg=theta_deg[is_se],
-        bse_theta_deg=theta_deg[~is_se],
-        se_phi_deg=phi_deg[is_se],
-        bse_phi_deg=phi_deg[~is_se],
+        se_energy_ev=emission_energy[is_se], bse_energy_ev=emission_energy[~is_se],
+        se_theta_deg=theta_deg[is_se], bse_theta_deg=theta_deg[~is_se],
+        se_phi_deg=phi_deg[is_se], bse_phi_deg=phi_deg[~is_se],
         se_direction_xyz=emission_direction[is_se],
         bse_direction_xyz=emission_direction[~is_se],
         se_emission_xyz=emission_xyz[is_se],
         bse_emission_xyz=emission_xyz[~is_se],
-        se_mu_beam_back=mu_beam_back[is_se],
-        bse_mu_beam_back=mu_beam_back[~is_se],
+        se_mu_beam_back=mu_beam_back[is_se], bse_mu_beam_back=mu_beam_back[~is_se],
         se_mu_toward_normal=mu_toward_normal[is_se],
         bse_mu_toward_normal=mu_toward_normal[~is_se],
-        se_mu_side=mu_side[is_se],
-        bse_mu_side=mu_side[~is_se],
+        se_mu_side=mu_side[is_se], bse_mu_side=mu_side[~is_se],
         se_emission_mechanism=emission_mechanism[is_se],
         bse_emission_mechanism=emission_mechanism[~is_se],
         se_barrier_reflection_probability=barrier_reflection_probability[is_se],
         bse_barrier_reflection_probability=barrier_reflection_probability[~is_se],
-        se_primary_id=se_ids,
-        bse_primary_id=bse_ids,
+        se_population_label=population_label[is_se],
+        bse_population_label=population_label[~is_se],
+        se_generation=emission_generation[is_se],
+        bse_generation=emission_generation[~is_se],
+        se_is_cascade=emission_is_cascade[is_se],
+        bse_is_cascade=emission_is_cascade[~is_se],
+        population_classifier_json=classifier_json,
+        se_primary_id=se_ids, bse_primary_id=bse_ids,
         se_counts_per_primary=np.bincount(se_ids, minlength=n_primaries),
         bse_counts_per_primary=np.bincount(bse_ids, minlength=n_primaries),
     )
     case.validate()
 
-    # The sampler is built from the actual Emission records, so first verify
-    # the non-negotiable invariant: every electron counted in TEY must have a
-    # corresponding raw emission record.  Compare integer counts rather than
-    # floating-point yields.
     n_done = int(model.n_completed[0])
     expected_total = int(round(float(model.tey[0]) * n_done))
     raw_total = int(emission_energy.size)
     if raw_total != expected_total:
         raise RuntimeError(
-            "raw emission records disagree with SEEMC TEY: "
-            f"raw={raw_total}, counter={expected_total}, "
-            f"E={energy:g} eV, angle={angle:g} deg, n={n_done}"
+            "history-derived emission records disagree with SEEMC TEY: "
+            f"raw={raw_total}, counter={expected_total}, E={energy:g} eV, "
+            f"angle={angle:g} deg, n={n_done}"
         )
 
-    # SEEMC also carries redundant <cutoff / >=cutoff counters.  The joint
-    # sampler, however, must follow the energies stored in the raw Emission
-    # records themselves.  A split-only disagreement (most easily exposed at
-    # exactly the cutoff) must not discard an otherwise complete event sample.
+    # Exact classifier partition invariants.
+    labels = population_label
+    cascade = emission_is_cascade
+    if np.count_nonzero(cascade) != np.count_nonzero(
+        np.char.startswith(labels.astype(str), "se1_")
+        | np.char.startswith(labels.astype(str), "se2_")
+    ):
+        raise RuntimeError("SE1/SE2 labels do not partition cascade emissions")
+    if np.count_nonzero(~cascade) != np.count_nonzero(
+        (labels == "lle_primary") | (labels == "non_lle_primary")
+    ):
+        raise RuntimeError("LLE/non-LLE labels do not partition emitted primaries")
+
     expected_se = int(round(float(model.sey_50ev[0]) * n_done))
     expected_bse = int(round(float(model.bse_50ev[0]) * n_done))
     raw_se = int(np.count_nonzero(is_se))
     raw_bse = int(raw_total - raw_se)
     if raw_se != expected_se or raw_bse != expected_bse:
         warnings.warn(
-            "SE/BSE bookkeeping differs from classification of the raw "
-            "emission records; using raw emission energies for sampler export. "
-            f"E={energy:g} eV, angle={angle:g} deg: "
-            f"raw SE/BSE={raw_se}/{raw_bse}, "
-            f"SEEMC counters={expected_se}/{expected_bse}, "
-            f"cutoff={config.bse_cutoff_ev:g} eV",
-            RuntimeWarning,
-            stacklevel=2,
+            "SE/BSE bookkeeping differs from raw emission energies; using raw "
+            f"energies. E={energy:g} eV, angle={angle:g} deg: raw SE/BSE="
+            f"{raw_se}/{raw_bse}, counters={expected_se}/{expected_bse}",
+            RuntimeWarning, stacklevel=2,
         )
     return case
-
 
 def _number_token(value: float) -> str:
     token = f"{float(value):.6f}".rstrip("0").rstrip(".")
@@ -580,6 +667,9 @@ def save_case_checkpoint(path, case: PlaneSamplerCase, *, material: str,
         ),
         "stores_joint_energy_direction": True,
         "stores_surface_emission_xyz": True,
+        "stores_population_labels": True,
+        "population_classifier_json": case.population_classifier_json,
+        "length_unit": "angstrom",
     }
     temporary = path.with_suffix(path.suffix + ".tmp")
     with open(temporary, "wb") as stream:
@@ -611,6 +701,13 @@ def save_case_checkpoint(path, case: PlaneSamplerCase, *, material: str,
             bse_emission_mechanism=case.bse_emission_mechanism,
             se_barrier_reflection_probability=case.se_barrier_reflection_probability,
             bse_barrier_reflection_probability=case.bse_barrier_reflection_probability,
+            se_population_label=case.se_population_label,
+            bse_population_label=case.bse_population_label,
+            se_generation=case.se_generation,
+            bse_generation=case.bse_generation,
+            se_is_cascade=case.se_is_cascade,
+            bse_is_cascade=case.bse_is_cascade,
+            population_classifier_json=np.asarray(case.population_classifier_json),
             se_primary_id=case.se_primary_id,
             bse_primary_id=case.bse_primary_id,
             se_counts_per_primary=case.se_counts_per_primary,
@@ -675,6 +772,13 @@ def load_case_checkpoint(path, *, material: Optional[str] = None,
             bse_barrier_reflection_probability=archive[
                 "bse_barrier_reflection_probability"
             ].astype(float),
+            se_population_label=archive["se_population_label"].astype(str),
+            bse_population_label=archive["bse_population_label"].astype(str),
+            se_generation=archive["se_generation"].astype(np.int64),
+            bse_generation=archive["bse_generation"].astype(np.int64),
+            se_is_cascade=archive["se_is_cascade"].astype(bool),
+            bse_is_cascade=archive["bse_is_cascade"].astype(bool),
+            population_classifier_json=str(archive["population_classifier_json"].item()),
             se_primary_id=archive["se_primary_id"].astype(np.int64),
             bse_primary_id=archive["bse_primary_id"].astype(np.int64),
             se_counts_per_primary=archive["se_counts_per_primary"].astype(np.int64),
