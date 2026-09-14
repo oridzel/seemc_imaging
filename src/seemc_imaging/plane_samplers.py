@@ -50,7 +50,7 @@ BSE_ENERGY_FILENAME = "BSEeEFromPlaneSampler_SEVaccum_t0nmCuFPA.csv"
 SE_THETA_FILENAME = "SEThetaFromPlaneSampler_uncoatedCuFPA.csv"
 BSE_THETA_FILENAME = "BSEThetaFromPlaneSampler_uncoatedCuFPA.csv"
 
-CHECKPOINT_SCHEMA = "seemc-plane-sampler-case-v4"
+CHECKPOINT_SCHEMA = "seemc-plane-sampler-case-v5"
 PACKAGE_VERSION = "0.7.5"
 
 
@@ -143,6 +143,21 @@ class PlaneSamplerCase:
     bse_primary_id: np.ndarray
     se_counts_per_primary: np.ndarray
     bse_counts_per_primary: np.ndarray
+
+    # Optional sampled trajectory polylines for interaction-volume plots.
+    # Each polyline belongs to one lineage family that ends in an emitted
+    # electron classified by ``trajectory_sample_population_label``.  The
+    # polyline vertices are flattened in ``trajectory_sample_xyz`` and sliced by
+    # ``trajectory_sample_offsets``.
+    trajectory_sample_population_label: np.ndarray
+    trajectory_sample_primary_id: np.ndarray
+    trajectory_sample_electron_id: np.ndarray
+    trajectory_sample_generation: np.ndarray
+    trajectory_sample_is_cascade: np.ndarray
+    trajectory_sample_family_id: np.ndarray
+    trajectory_sample_segment_id: np.ndarray
+    trajectory_sample_offsets: np.ndarray
+    trajectory_sample_xyz: np.ndarray
 
     @property
     def sey(self) -> float:
@@ -486,6 +501,217 @@ def _emissions_from_histories(histories, classifier):
     )
 
 
+def _record_electron_id(record):
+    for name in ("electron_id", "id"):
+        value = getattr(record, name, None)
+        if value is not None:
+            return int(value)
+    raise RuntimeError("history electron record lacks an electron ID")
+
+
+def _record_parent_electron_id(record):
+    for name in ("parent_electron_id", "parent_id", "parent"):
+        value = getattr(record, name, None)
+        if value is not None:
+            return int(value)
+    return None
+
+
+def _position_tuple(value):
+    if value is None:
+        return None
+    try:
+        arr = np.asarray(value, dtype=float).reshape(-1)
+    except Exception:
+        return None
+    if arr.size < 3 or not np.all(np.isfinite(arr[:3])):
+        return None
+    return tuple(float(v) for v in arr[:3])
+
+
+def _event_position(event):
+    for name in ("position", "xyz", "point", "location"):
+        pos = _position_tuple(getattr(event, name, None))
+        if pos is not None:
+            return pos
+    return None
+
+
+def _record_initial_position(record):
+    for name in ("initial_position", "start_position", "position_initial", "xyz0"):
+        pos = _position_tuple(getattr(record, name, None))
+        if pos is not None:
+            return pos
+    return None
+
+
+def _record_final_position(record):
+    for name in ("final_position", "end_position", "position_final", "xyz1"):
+        pos = _position_tuple(getattr(record, name, None))
+        if pos is not None:
+            return pos
+    return None
+
+
+def _unique_append_point(points, point):
+    if point is None:
+        return
+    if not points or any(abs(a - b) > 1.0e-12 for a, b in zip(points[-1], point)):
+        points.append(point)
+
+
+def _trajectory_polyline_for_record(history, record):
+    target_id = _record_electron_id(record)
+    points = []
+    _unique_append_point(points, _record_initial_position(record))
+    for event in getattr(history, "events", []):
+        if getattr(event, "electron_id", None) == target_id:
+            _unique_append_point(points, _event_position(event))
+    _unique_append_point(points, _record_final_position(record))
+    if len(points) == 1:
+        points.append(points[0])
+    if len(points) < 2:
+        return np.empty((0, 3), dtype=float)
+    return np.asarray(points, dtype=float).reshape((-1, 3))
+
+
+def _sample_population_trajectory_polylines(histories, classifier, *,
+                                            samples_per_class: int = 0,
+                                            population_labels: Optional[Sequence[str]] = None,
+                                            seed: int = 12345):
+    if int(samples_per_class) <= 0:
+        empty_i = np.empty(0, dtype=np.int64)
+        empty_b = np.empty(0, dtype=bool)
+        return {
+            "population_label": np.empty(0, dtype=str),
+            "primary_id": empty_i,
+            "electron_id": empty_i,
+            "generation": empty_i,
+            "is_cascade": empty_b,
+            "family_id": empty_i,
+            "segment_id": empty_i,
+            "offsets": np.asarray([0], dtype=np.int64),
+            "xyz": np.empty((0, 3), dtype=float),
+        }
+
+    rng = np.random.default_rng(int(seed))
+    wanted = None if population_labels is None else {str(x) for x in population_labels}
+    emitted = []
+    family_id = 0
+    for history in sorted(histories, key=lambda h: (-1 if h.trajectory_id is None else h.trajectory_id)):
+        trajectory_id = history.trajectory_id
+        if trajectory_id is None:
+            continue
+        records = [r for r in getattr(history, "electrons", []) if getattr(r, "fate", None) == "emitted"]
+        classifier_emissions = []
+        by_id = {}
+        for record in records:
+            eid = _record_electron_id(record)
+            by_id[eid] = record
+            event = _history_escape_event(history, eid)
+            surface_normal = None if event is None else getattr(event, "surface_normal", None)
+            classifier_emissions.append(SimpleNamespace(
+                energy=float(record.final_energy),
+                is_cascade=not bool(record.is_primary),
+                generation=int(record.generation),
+                electron_id=eid,
+                surface_normal=surface_normal,
+            ))
+        labels = classifier.emission_labels(SimpleNamespace(history=history, emissions=classifier_emissions, tey=len(classifier_emissions)))
+        for record in records:
+            eid = _record_electron_id(record)
+            label = str(labels[eid])
+            if wanted is not None and label not in wanted:
+                continue
+            emitted.append({
+                "history": history,
+                "record": record,
+                "label": label,
+                "trajectory_id": int(trajectory_id),
+                "electron_id": eid,
+                "generation": int(record.generation),
+                "is_cascade": not bool(record.is_primary),
+            })
+            family_id += 1
+
+    if not emitted:
+        empty_i = np.empty(0, dtype=np.int64)
+        empty_b = np.empty(0, dtype=bool)
+        return {
+            "population_label": np.empty(0, dtype=str),
+            "primary_id": empty_i,
+            "electron_id": empty_i,
+            "generation": empty_i,
+            "is_cascade": empty_b,
+            "family_id": empty_i,
+            "segment_id": empty_i,
+            "offsets": np.asarray([0], dtype=np.int64),
+            "xyz": np.empty((0, 3), dtype=float),
+        }
+
+    by_label = {}
+    for item in emitted:
+        by_label.setdefault(item["label"], []).append(item)
+
+    selected = []
+    for label, items in sorted(by_label.items()):
+        if len(items) > int(samples_per_class):
+            idx = np.sort(rng.choice(len(items), size=int(samples_per_class), replace=False))
+            chosen = [items[i] for i in idx]
+        else:
+            chosen = items
+        selected.extend(chosen)
+
+    # Build family polylines: every lineage member gets its own polyline, grouped by family_id.
+    pop_labels = []
+    primary_ids = []
+    electron_ids = []
+    generations = []
+    is_cascade = []
+    family_ids = []
+    segment_ids = []
+    offsets = [0]
+    xyz_blocks = []
+
+    for fam_id, item in enumerate(selected):
+        history = item["history"]
+        by_id = {_record_electron_id(r): r for r in getattr(history, "electrons", [])}
+        lineage = []
+        cursor = item["electron_id"]
+        visited = set()
+        while cursor is not None and cursor in by_id and cursor not in visited:
+            visited.add(cursor)
+            record = by_id[cursor]
+            lineage.append(record)
+            cursor = _record_parent_electron_id(record)
+        lineage = list(reversed(lineage))
+        for seg_id, record in enumerate(lineage):
+            poly = _trajectory_polyline_for_record(history, record)
+            if poly.size == 0:
+                continue
+            xyz_blocks.append(poly)
+            pop_labels.append(item["label"])
+            primary_ids.append(item["trajectory_id"])
+            electron_ids.append(_record_electron_id(record))
+            generations.append(int(getattr(record, "generation", seg_id)))
+            is_cascade.append(not bool(getattr(record, "is_primary", seg_id == 0 and False)))
+            family_ids.append(fam_id)
+            segment_ids.append(seg_id)
+            offsets.append(offsets[-1] + poly.shape[0])
+
+    return {
+        "population_label": np.asarray(pop_labels, dtype=str),
+        "primary_id": np.asarray(primary_ids, dtype=np.int64),
+        "electron_id": np.asarray(electron_ids, dtype=np.int64),
+        "generation": np.asarray(generations, dtype=np.int64),
+        "is_cascade": np.asarray(is_cascade, dtype=bool),
+        "family_id": np.asarray(family_ids, dtype=np.int64),
+        "segment_id": np.asarray(segment_ids, dtype=np.int64),
+        "offsets": np.asarray(offsets, dtype=np.int64),
+        "xyz": np.concatenate(xyz_blocks, axis=0) if xyz_blocks else np.empty((0, 3), dtype=float),
+    }
+
+
 def run_plane_sampler_case(
     database_path,
     material: str,
@@ -497,6 +723,8 @@ def run_plane_sampler_case(
     case_seed: int = 12345,
     workers: int = 1,
     progress: bool = True,
+    trajectory_samples_per_class: int = 0,
+    trajectory_population_labels: Optional[Sequence[str]] = None,
 ) -> PlaneSamplerCase:
     """Run one planar case with the exact raster population definitions."""
     # Local import avoids making plane sampler import order depend on raster.
@@ -536,6 +764,12 @@ def run_plane_sampler_case(
         emission_mechanism, barrier_reflection_probability, population_label,
         emission_generation, emission_is_cascade,
     ) = _emissions_from_histories(model.histories[0], classifier)
+    trajectory_samples = _sample_population_trajectory_polylines(
+        model.histories[0], classifier,
+        samples_per_class=int(trajectory_samples_per_class),
+        population_labels=trajectory_population_labels,
+        seed=int(case_seed),
+    )
 
     if emission_direction.size:
         (
@@ -593,6 +827,15 @@ def run_plane_sampler_case(
         se_primary_id=se_ids, bse_primary_id=bse_ids,
         se_counts_per_primary=np.bincount(se_ids, minlength=n_primaries),
         bse_counts_per_primary=np.bincount(bse_ids, minlength=n_primaries),
+        trajectory_sample_population_label=trajectory_samples["population_label"],
+        trajectory_sample_primary_id=trajectory_samples["primary_id"],
+        trajectory_sample_electron_id=trajectory_samples["electron_id"],
+        trajectory_sample_generation=trajectory_samples["generation"],
+        trajectory_sample_is_cascade=trajectory_samples["is_cascade"],
+        trajectory_sample_family_id=trajectory_samples["family_id"],
+        trajectory_sample_segment_id=trajectory_samples["segment_id"],
+        trajectory_sample_offsets=trajectory_samples["offsets"],
+        trajectory_sample_xyz=trajectory_samples["xyz"],
     )
     case.validate()
 
@@ -712,6 +955,15 @@ def save_case_checkpoint(path, case: PlaneSamplerCase, *, material: str,
             bse_primary_id=case.bse_primary_id,
             se_counts_per_primary=case.se_counts_per_primary,
             bse_counts_per_primary=case.bse_counts_per_primary,
+            trajectory_sample_population_label=case.trajectory_sample_population_label,
+            trajectory_sample_primary_id=case.trajectory_sample_primary_id,
+            trajectory_sample_electron_id=case.trajectory_sample_electron_id,
+            trajectory_sample_generation=case.trajectory_sample_generation,
+            trajectory_sample_is_cascade=case.trajectory_sample_is_cascade,
+            trajectory_sample_family_id=case.trajectory_sample_family_id,
+            trajectory_sample_segment_id=case.trajectory_sample_segment_id,
+            trajectory_sample_offsets=case.trajectory_sample_offsets,
+            trajectory_sample_xyz=case.trajectory_sample_xyz,
         )
     os.replace(temporary, path)
     return path
@@ -783,6 +1035,15 @@ def load_case_checkpoint(path, *, material: Optional[str] = None,
             bse_primary_id=archive["bse_primary_id"].astype(np.int64),
             se_counts_per_primary=archive["se_counts_per_primary"].astype(np.int64),
             bse_counts_per_primary=archive["bse_counts_per_primary"].astype(np.int64),
+            trajectory_sample_population_label=archive["trajectory_sample_population_label"].astype(str),
+            trajectory_sample_primary_id=archive["trajectory_sample_primary_id"].astype(np.int64),
+            trajectory_sample_electron_id=archive["trajectory_sample_electron_id"].astype(np.int64),
+            trajectory_sample_generation=archive["trajectory_sample_generation"].astype(np.int64),
+            trajectory_sample_is_cascade=archive["trajectory_sample_is_cascade"].astype(bool),
+            trajectory_sample_family_id=archive["trajectory_sample_family_id"].astype(np.int64),
+            trajectory_sample_segment_id=archive["trajectory_sample_segment_id"].astype(np.int64),
+            trajectory_sample_offsets=archive["trajectory_sample_offsets"].astype(np.int64),
+            trajectory_sample_xyz=archive["trajectory_sample_xyz"].astype(float),
         )
     case.validate()
     expected = (
@@ -997,6 +1258,8 @@ def generate_plane_sampler_library(
     overwrite: bool = False,
     progress: bool = True,
     status: Optional[Callable[[str], None]] = print,
+    trajectory_samples_per_class: int = 0,
+    trajectory_population_labels: Optional[Sequence[str]] = None,
 ) -> list[PlaneSamplerCase]:
     """Run, checkpoint, validate, and export a complete planar library."""
     config = config or MCConfig()
@@ -1054,6 +1317,8 @@ def generate_plane_sampler_library(
                     database_path, material, energy, angle, n_primaries,
                     config=config, case_seed=seed, workers=workers,
                     progress=progress,
+                    trajectory_samples_per_class=trajectory_samples_per_class,
+                    trajectory_population_labels=trajectory_population_labels,
                 )
                 save_case_checkpoint(
                     raw_path, case, material=material, config=config,
@@ -1131,6 +1396,8 @@ def generate_plane_sampler_library(
         "incoming_barrier_reflection": bool(
             getattr(config, "incoming_barrier_reflection", False)
         ),
+        "trajectory_samples_per_class": int(trajectory_samples_per_class),
+        "trajectory_population_labels": None if trajectory_population_labels is None else [str(x) for x in trajectory_population_labels],
         "mc_config": asdict(config),
         "mc_config_sha256": _config_sha256(config),
     }

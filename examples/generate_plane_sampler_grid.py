@@ -63,6 +63,20 @@ def build_parser() -> argparse.ArgumentParser:
                         help="replace existing case checkpoints")
     parser.add_argument("--no-progress", action="store_true",
                         help="disable per-trajectory progress bars")
+    parser.add_argument(
+        "--trajectory-samples-per-class", type=int, default=0,
+        help=(
+            "save up to this many emitted lineages per population label as "
+            "sampled trajectory polylines in each raw checkpoint; 0 disables"
+        ),
+    )
+    parser.add_argument(
+        "--trajectory-populations", nargs="+", default=None, metavar="LABEL",
+        help=(
+            "optional population labels to retain for sampled trajectories, "
+            "for example se1_lt50 se2_lt50 se1_ge50 se2_ge50 lle_primary non_lle_primary"
+        ),
+    )
 
     physics = parser.add_argument_group("transport model")
     physics.add_argument(
@@ -159,6 +173,8 @@ def main(argv=None) -> int:
         resume=args.resume,
         overwrite=args.overwrite,
         progress=not args.no_progress,
+        trajectory_samples_per_class=args.trajectory_samples_per_class,
+        trajectory_population_labels=args.trajectory_populations,
     )
     print(
         f"Wrote {len(cases)} cases, {len(angles)} angle directories, "
