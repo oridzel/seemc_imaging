@@ -49,7 +49,7 @@ BSE_ENERGY_FILENAME = "BSEeEFromPlaneSampler_SEVaccum_t0nmCuFPA.csv"
 SE_THETA_FILENAME = "SEThetaFromPlaneSampler_uncoatedCuFPA.csv"
 BSE_THETA_FILENAME = "BSEThetaFromPlaneSampler_uncoatedCuFPA.csv"
 
-CHECKPOINT_SCHEMA = "seemc-plane-sampler-case-v2"
+CHECKPOINT_SCHEMA = "seemc-plane-sampler-case-v3"
 PACKAGE_VERSION = "0.7.5"
 
 
@@ -113,6 +113,10 @@ class PlaneSamplerCase:
     bse_phi_deg: np.ndarray
     se_direction_xyz: np.ndarray
     bse_direction_xyz: np.ndarray
+    # Surface-exit positions from the raw Emission records. These are the
+    # spatial coordinates used to construct point-spread functions.
+    se_emission_xyz: np.ndarray
+    bse_emission_xyz: np.ndarray
     se_mu_beam_back: np.ndarray
     bse_mu_beam_back: np.ndarray
     se_mu_toward_normal: np.ndarray
@@ -173,7 +177,7 @@ class PlaneSamplerCase:
         pairs = (
             (
                 self.se_energy_ev, self.se_theta_deg, self.se_phi_deg,
-                self.se_direction_xyz, self.se_mu_beam_back,
+                self.se_direction_xyz, self.se_emission_xyz, self.se_mu_beam_back,
                 self.se_mu_toward_normal, self.se_mu_side,
                 self.se_emission_mechanism,
                 self.se_barrier_reflection_probability,
@@ -181,7 +185,7 @@ class PlaneSamplerCase:
             ),
             (
                 self.bse_energy_ev, self.bse_theta_deg, self.bse_phi_deg,
-                self.bse_direction_xyz, self.bse_mu_beam_back,
+                self.bse_direction_xyz, self.bse_emission_xyz, self.bse_mu_beam_back,
                 self.bse_mu_toward_normal, self.bse_mu_side,
                 self.bse_emission_mechanism,
                 self.bse_barrier_reflection_probability,
@@ -189,7 +193,7 @@ class PlaneSamplerCase:
             ),
         )
         for (
-            energies, theta, phi, directions, mu_b, mu_t, mu_s,
+            energies, theta, phi, directions, positions, mu_b, mu_t, mu_s,
             mechanism, barrier_r, primary_ids, label
         ) in pairs:
             one_d = (
@@ -200,10 +204,13 @@ class PlaneSamplerCase:
                 raise ValueError(f"{label} scalar raw arrays must be one-dimensional")
             if directions.ndim != 2 or directions.shape[1] != 3:
                 raise ValueError(f"{label} direction array must have shape (N, 3)")
+            if positions.ndim != 2 or positions.shape[1] != 3:
+                raise ValueError(f"{label} emission-position array must have shape (N, 3)")
             n = energies.size
-            if any(array.size != n for array in one_d[1:]) or directions.shape[0] != n:
+            if (any(array.size != n for array in one_d[1:])
+                    or directions.shape[0] != n or positions.shape[0] != n):
                 raise ValueError(f"{label} joint emission-array lengths differ")
-            numeric = (energies, theta, phi, mu_b, mu_t, mu_s, directions)
+            numeric = (energies, theta, phi, mu_b, mu_t, mu_s, directions, positions)
             if any(not np.all(np.isfinite(array)) for array in numeric):
                 raise ValueError(f"{label} raw arrays contain non-finite values")
             # barrier_r is NaN for ordinary transport escapes and finite only
@@ -402,6 +409,17 @@ def run_plane_sampler_case(
         emission_direction = np.asarray(
             [item.uvw for item in emissions], dtype=float
         )
+        # ``Emission.xyz`` is the position at which the electron is recorded
+        # as emitted from the solid. Keep it paired event-by-event with energy,
+        # direction, mechanism, and root primary ID for PSF analysis.
+        if any(getattr(item, "xyz", None) is None for item in emissions):
+            raise RuntimeError(
+                "raw Emission records do not contain xyz positions; "
+                "PSF export requires transport Emission.xyz support"
+            )
+        emission_xyz = np.asarray(
+            [item.xyz for item in emissions], dtype=float
+        )
         primary_id = np.asarray(
             [item.root_primary_id for item in emissions], dtype=np.int64
         )
@@ -440,6 +458,7 @@ def run_plane_sampler_case(
     else:
         emission_energy = np.empty(0, dtype=float)
         emission_direction = np.empty((0, 3), dtype=float)
+        emission_xyz = np.empty((0, 3), dtype=float)
         theta_deg = np.empty(0, dtype=float)
         phi_deg = np.empty(0, dtype=float)
         mu_beam_back = np.empty(0, dtype=float)
@@ -471,6 +490,8 @@ def run_plane_sampler_case(
         bse_phi_deg=phi_deg[~is_se],
         se_direction_xyz=emission_direction[is_se],
         bse_direction_xyz=emission_direction[~is_se],
+        se_emission_xyz=emission_xyz[is_se],
+        bse_emission_xyz=emission_xyz[~is_se],
         se_mu_beam_back=mu_beam_back[is_se],
         bse_mu_beam_back=mu_beam_back[~is_se],
         se_mu_toward_normal=mu_toward_normal[is_se],
@@ -558,6 +579,7 @@ def save_case_checkpoint(path, case: PlaneSamplerCase, *, material: str,
             "sample normal in the incidence plane"
         ),
         "stores_joint_energy_direction": True,
+        "stores_surface_emission_xyz": True,
     }
     temporary = path.with_suffix(path.suffix + ".tmp")
     with open(temporary, "wb") as stream:
@@ -577,6 +599,8 @@ def save_case_checkpoint(path, case: PlaneSamplerCase, *, material: str,
             bse_phi_deg=case.bse_phi_deg,
             se_direction_xyz=case.se_direction_xyz,
             bse_direction_xyz=case.bse_direction_xyz,
+            se_emission_xyz=case.se_emission_xyz,
+            bse_emission_xyz=case.bse_emission_xyz,
             se_mu_beam_back=case.se_mu_beam_back,
             bse_mu_beam_back=case.bse_mu_beam_back,
             se_mu_toward_normal=case.se_mu_toward_normal,
@@ -635,6 +659,8 @@ def load_case_checkpoint(path, *, material: Optional[str] = None,
             bse_phi_deg=archive["bse_phi_deg"].astype(float),
             se_direction_xyz=archive["se_direction_xyz"].astype(float),
             bse_direction_xyz=archive["bse_direction_xyz"].astype(float),
+            se_emission_xyz=archive["se_emission_xyz"].astype(float),
+            bse_emission_xyz=archive["bse_emission_xyz"].astype(float),
             se_mu_beam_back=archive["se_mu_beam_back"].astype(float),
             bse_mu_beam_back=archive["bse_mu_beam_back"].astype(float),
             se_mu_toward_normal=archive["se_mu_toward_normal"].astype(float),
