@@ -50,7 +50,7 @@ BSE_ENERGY_FILENAME = "BSEeEFromPlaneSampler_SEVaccum_t0nmCuFPA.csv"
 SE_THETA_FILENAME = "SEThetaFromPlaneSampler_uncoatedCuFPA.csv"
 BSE_THETA_FILENAME = "BSEThetaFromPlaneSampler_uncoatedCuFPA.csv"
 
-CHECKPOINT_SCHEMA = "seemc-plane-sampler-case-v5"
+CHECKPOINT_SCHEMA = "seemc-plane-sampler-case-v6"
 PACKAGE_VERSION = "0.7.5"
 
 
@@ -156,6 +156,7 @@ class PlaneSamplerCase:
     trajectory_sample_is_cascade: np.ndarray
     trajectory_sample_family_id: np.ndarray
     trajectory_sample_segment_id: np.ndarray
+    trajectory_sample_birth_xyz: np.ndarray
     trajectory_sample_offsets: np.ndarray
     trajectory_sample_xyz: np.ndarray
 
@@ -538,7 +539,7 @@ def _event_position(event):
 
 
 def _record_initial_position(record):
-    for name in ("initial_position", "start_position", "position_initial", "xyz0"):
+    for name in ("birth_position", "initial_position", "start_position", "position_initial", "xyz0"):
         pos = _position_tuple(getattr(record, name, None))
         if pos is not None:
             return pos
@@ -590,6 +591,7 @@ def _sample_population_trajectory_polylines(histories, classifier, *,
             "is_cascade": empty_b,
             "family_id": empty_i,
             "segment_id": empty_i,
+            "birth_xyz": np.empty((0, 3), dtype=float),
             "offsets": np.asarray([0], dtype=np.int64),
             "xyz": np.empty((0, 3), dtype=float),
         }
@@ -645,6 +647,7 @@ def _sample_population_trajectory_polylines(histories, classifier, *,
             "is_cascade": empty_b,
             "family_id": empty_i,
             "segment_id": empty_i,
+            "birth_xyz": np.empty((0, 3), dtype=float),
             "offsets": np.asarray([0], dtype=np.int64),
             "xyz": np.empty((0, 3), dtype=float),
         }
@@ -670,6 +673,7 @@ def _sample_population_trajectory_polylines(histories, classifier, *,
     is_cascade = []
     family_ids = []
     segment_ids = []
+    birth_xyz = []
     offsets = [0]
     xyz_blocks = []
 
@@ -697,6 +701,10 @@ def _sample_population_trajectory_polylines(histories, classifier, *,
             is_cascade.append(not bool(getattr(record, "is_primary", seg_id == 0 and False)))
             family_ids.append(fam_id)
             segment_ids.append(seg_id)
+            birth = _position_tuple(getattr(record, "birth_position", None))
+            if birth is None:
+                birth = tuple(float(v) for v in poly[0])
+            birth_xyz.append(birth)
             offsets.append(offsets[-1] + poly.shape[0])
 
     return {
@@ -707,6 +715,7 @@ def _sample_population_trajectory_polylines(histories, classifier, *,
         "is_cascade": np.asarray(is_cascade, dtype=bool),
         "family_id": np.asarray(family_ids, dtype=np.int64),
         "segment_id": np.asarray(segment_ids, dtype=np.int64),
+        "birth_xyz": np.asarray(birth_xyz, dtype=float).reshape((-1, 3)),
         "offsets": np.asarray(offsets, dtype=np.int64),
         "xyz": np.concatenate(xyz_blocks, axis=0) if xyz_blocks else np.empty((0, 3), dtype=float),
     }
@@ -834,6 +843,7 @@ def run_plane_sampler_case(
         trajectory_sample_is_cascade=trajectory_samples["is_cascade"],
         trajectory_sample_family_id=trajectory_samples["family_id"],
         trajectory_sample_segment_id=trajectory_samples["segment_id"],
+        trajectory_sample_birth_xyz=trajectory_samples["birth_xyz"],
         trajectory_sample_offsets=trajectory_samples["offsets"],
         trajectory_sample_xyz=trajectory_samples["xyz"],
     )
@@ -962,6 +972,7 @@ def save_case_checkpoint(path, case: PlaneSamplerCase, *, material: str,
             trajectory_sample_is_cascade=case.trajectory_sample_is_cascade,
             trajectory_sample_family_id=case.trajectory_sample_family_id,
             trajectory_sample_segment_id=case.trajectory_sample_segment_id,
+            trajectory_sample_birth_xyz=case.trajectory_sample_birth_xyz,
             trajectory_sample_offsets=case.trajectory_sample_offsets,
             trajectory_sample_xyz=case.trajectory_sample_xyz,
         )
@@ -1042,6 +1053,7 @@ def load_case_checkpoint(path, *, material: Optional[str] = None,
             trajectory_sample_is_cascade=archive["trajectory_sample_is_cascade"].astype(bool),
             trajectory_sample_family_id=archive["trajectory_sample_family_id"].astype(np.int64),
             trajectory_sample_segment_id=archive["trajectory_sample_segment_id"].astype(np.int64),
+            trajectory_sample_birth_xyz=archive["trajectory_sample_birth_xyz"].astype(float),
             trajectory_sample_offsets=archive["trajectory_sample_offsets"].astype(np.int64),
             trajectory_sample_xyz=archive["trajectory_sample_xyz"].astype(float),
         )

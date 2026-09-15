@@ -639,6 +639,12 @@ class Diagnostics(dict):
         "inelastic_events",
         "elastic_events",
         "surface_encounters",
+        "surface_transmissions_to_vacuum",
+        "vacuum_flights",
+        "vacuum_surface_hits",
+        "vacuum_reentries",
+        "vacuum_barrier_reflections",
+        "final_escapes",
         "escapes",
         "internal_reflections",
         "incoming_barrier_encounters",
@@ -1751,7 +1757,10 @@ class _HistoryRecorder:
             record.first_surface_return_kind = event.kind
 
     def record_surface(self, electron, escaped, energy_before, direction_before):
-        kind = "emission" if escaped else "surface_reflection"
+        # A successful solid->vacuum barrier crossing is only a *local* surface
+        # exit.  In a structured specimen the electron may hit another feature
+        # and re-enter, so do not call it a final emission here.
+        kind = "surface_exit" if escaped else "surface_reflection"
         hit = electron.last_surface_hit
         event = self._event(
             electron_id=electron.electron_id,
@@ -1763,7 +1772,7 @@ class _HistoryRecorder:
             direction_after=_vec3(electron.uvw),
             time_fs=float(electron.time_fs),
             step_length=float(electron.last_step_length),
-            outcome="escaped" if escaped else "reflected",
+            outcome="transmitted_to_vacuum" if escaped else "reflected",
             surface_id=None if hit is None else hit.surface_id,
             surface_normal=None if hit is None else _vec3(hit.normal),
             region_from=None if hit is None else hit.region_from,
@@ -1774,6 +1783,41 @@ class _HistoryRecorder:
         record.surface_encounters += 1
         if not escaped:
             record.internal_reflections += 1
+        self._observe(record, electron.xyz)
+        return event.event_id
+
+    def record_vacuum_surface(self, electron, transmitted, energy_before,
+                              direction_before, entry):
+        """Record a vacuum->solid encounter without declaring final emission."""
+        hit = electron.last_surface_hit
+        outward = None if hit is None else tuple(-value for value in hit.normal)
+        event = self._event(
+            electron_id=electron.electron_id,
+            kind=("surface_reentry" if transmitted
+                  else "surface_entry_reflection"),
+            position=_vec3(electron.xyz),
+            energy_before=float(energy_before),
+            energy_after=float(electron.energy),
+            direction_before=_vec3(direction_before),
+            direction_after=_vec3(electron.uvw),
+            time_fs=float(electron.time_fs),
+            step_length=float(electron.last_step_length),
+            outcome=("transmitted_to_solid" if transmitted
+                     else "reflected_to_vacuum"),
+            surface_id=None if hit is None else hit.surface_id,
+            surface_normal=None if outward is None else _vec3(outward),
+            region_from=None if hit is None else hit.region_from,
+            region_to=(None if hit is None else
+                       (hit.region_to if transmitted else hit.region_from)),
+            primitive_id=None if hit is None else hit.primitive_id,
+            metadata={
+                "transmission_probability": float(entry["T"]),
+                "reflection_probability": float(entry["R"]),
+                "E_perp_vac_eV": float(entry["E_perp_vac"]),
+            },
+        )
+        record = self._record_for(electron.electron_id)
+        record.surface_encounters += 1
         self._observe(record, electron.xyz)
         return event.event_id
 
@@ -1861,12 +1905,20 @@ class Electron:
         )
         self.history = history
 
-        self.inside = True
+        solid_region = getattr(self.geometry, "solid_region", SOLID_REGION)
+        self.inside = self.current_region == solid_region
         self.dead = False
         self.fate = None
         self.path_length = 0.0
         self.last_step_length = 0.0
         self.last_surface_hit = None
+        # Canonically oriented (solid->vacuum) surface responsible for the
+        # electron's most recent return to vacuum.  This is retained while the
+        # electron flies through vacuum so final-emission metadata refers to the
+        # correct line/sidewall even when no further geometry hit exists.
+        self.last_emission_surface = None
+        self.final_emission_mechanism = None
+        self.barrier_reflection_probability = None
         self.time_fs = float(birth_time_fs)
         self.save_coordinates = bool(save_coordinates)
         self.coordinates = []
@@ -1940,7 +1992,7 @@ class Electron:
 
         self.path_length += s
         self.last_step_length = s
-        if self.save_coordinates:
+        if self.save_coordinates or self.history is not None:
             self.time_fs += _flight_time_fs(s, self.energy)
         self.xyz[0] += self.uvw[0] * s
         self.xyz[1] += self.uvw[1] * s
@@ -1949,6 +2001,82 @@ class Electron:
             self.xyz[:] = self.last_surface_hit.position
         self._record()
         return hit_surface
+
+    def travel_vacuum(self):
+        """Fly ballistically in vacuum to the next specimen interface.
+
+        Returns True when another surface is hit.  False means the ray has no
+        further intersection with the complete geometry and the electron is a
+        *final* emitted electron.  No scattering or energy loss occurs in
+        vacuum.
+        """
+        if self.inside:
+            raise RuntimeError("travel_vacuum() requires an electron in vacuum")
+
+        hit = self.geometry.first_hit(
+            self.xyz, self.uvw, math.inf, self.current_region
+        )
+        self.last_surface_hit = hit
+        if hit is None:
+            self.last_step_length = 0.0
+            return False
+
+        distance = float(hit.distance)
+        self.path_length += distance
+        self.last_step_length = distance
+        if self.save_coordinates or self.history is not None:
+            self.time_fs += _flight_time_fs(distance, self.energy)
+        self.xyz[:] = hit.position
+        self._record()
+        return True
+
+    def enter_from_vacuum(self):
+        """Apply the reciprocal barrier at a vacuum->solid geometry hit.
+
+        Returns ``(transmitted, entry_result)``.  A reflected electron remains
+        in vacuum and may hit another feature; a transmitted electron resumes
+        ordinary solid Monte Carlo transport with E_s = E_vac + U_i.
+        """
+        if self.inside:
+            raise RuntimeError("enter_from_vacuum() requires an electron in vacuum")
+        hit = self.last_surface_hit
+        if hit is None:
+            raise RuntimeError("enter_from_vacuum() requires a preceding vacuum hit")
+
+        outward = tuple(-value for value in hit.normal)
+        entry = sample_incoming_barrier(
+            self.energy, self.sample, self.uvw, outward, self.rng
+        )
+
+        if entry["reflected"]:
+            self.uvw = list(entry["vacuum_direction_out"])
+            self.current_region = hit.region_from
+            self.inside = False
+            self.fate = None
+            # Store this reflected surface as the latest surface from which the
+            # electron is heading into vacuum.  Use canonical solid->vacuum
+            # orientation for downstream hemisphere classification.
+            self.last_emission_surface = SurfaceHit(
+                distance=0.0,
+                position=_vec3(hit.position),
+                normal=outward,
+                surface_id=hit.surface_id,
+                region_from=hit.region_to,
+                region_to=hit.region_from,
+                primitive_id=hit.primitive_id,
+            )
+            self.final_emission_mechanism = "vacuum_barrier_reflection"
+            self.barrier_reflection_probability = float(entry["R"])
+        else:
+            self.energy = float(entry["E_s"])
+            self.uvw = list(entry["solid_direction"])
+            self.current_region = hit.region_to
+            self.inside = True
+            self.fate = None
+
+        self.xyz[:] = hit.position
+        self._record()
+        return (not entry["reflected"]), entry
 
     def _hit_for_direct_escape(self):
         """Construct the plane hit needed by legacy direct ``escape()`` calls."""
@@ -2020,11 +2148,17 @@ class Electron:
             ]
 
         self.inside = False
-        self.fate = "emitted"
+        # Crossing one local surface is not necessarily final emission in a
+        # multi-feature scene.  The vacuum-flight loop decides that only after
+        # confirming that no other specimen surface lies ahead.
+        self.fate = None
         self.current_region = hit.region_to
         self.uvw = outgoing
         self.energy = Ev
         self.xyz[:] = hit.position
+        self.last_emission_surface = hit
+        self.final_emission_mechanism = "transport_escape"
+        self.barrier_reflection_probability = None
         self._record()
         return True
 
@@ -2569,124 +2703,155 @@ def simulate_trajectory(sample: Sample, E0, angle_rad, rng, track=False,
     local_cosine = max(-1.0, min(1.0, -_dot3(vacuum, outward)))
     history_angle = math.acos(local_cosine)
 
+    vacuum_region = getattr(geometry, "vacuum_region", VACUUM_REGION)
+
+    def _finalize_emission(e):
+        """Count an electron only after it has escaped the *entire* scene."""
+        e.fate = "emitted"
+        diag["escapes"] += 1
+        diag["final_escapes"] += 1
+        res.tey += 1
+        if e.is_cascade:
+            res.sey_cascade += 1
+        else:
+            res.bse_cascade += 1
+
+        tol_ev = 1e-9
+        if e.energy <= cfg.bse_cutoff_ev + tol_ev:
+            res.sey_50ev += 1
+        else:
+            res.bse_50ev += 1
+
+        if not cfg.collect_spectra:
+            return
+
+        hit = e.last_emission_surface
+        normal = outward if hit is None else hit.normal
+        res.emissions.append(
+            Emission(
+                energy=float(e.energy),
+                uz=_dot3(e.uvw, normal),
+                is_cascade=e.is_cascade,
+                generation=e.generation,
+                birth_depth=e.birth_depth,
+                electron_id=e.electron_id,
+                parent_id=e.parent_id,
+                root_primary_id=e.root_primary_id,
+                xyz=_vec3(e.xyz),
+                uvw=_vec3(e.uvw),
+                surface_id=(getattr(geometry, "surface_id", "sample")
+                            if hit is None else hit.surface_id),
+                surface_normal=_vec3(normal),
+                region_from=(solid_region if hit is None else hit.region_from),
+                region_to=(vacuum_region if hit is None else hit.region_to),
+                primitive_id=(0 if hit is None else hit.primitive_id),
+                emission_mechanism=(e.final_emission_mechanism
+                                    or "transport_escape"),
+                barrier_reflection_probability=(
+                    e.barrier_reflection_probability
+                ),
+            )
+        )
+
     entry = sample_incoming_barrier(
         float(E0), sample, vacuum, outward, rng
     )
     diag["incoming_barrier_encounters"] += 1
 
-    # A barrier-reflected primary never enters the solid, so it is an emitted
-    # primary/BSE immediately.  This is the narrow specular population that
-    # appears at theta = 2*incidence_angle for a planar tilted sample.
     if entry["reflected"]:
+        # A primary reflected by the first surface is now merely in vacuum.
+        # On structured specimens it can strike another line or the substrate,
+        # so do not count it as emitted until the vacuum ray misses the entire
+        # geometry.
         diag["incoming_barrier_reflections"] += 1
-        diag["escapes"] += 1
-        res.tey = 1
-        res.bse_cascade = 1
-        tol_ev = 1e-9
-        if float(E0) <= cfg.bse_cutoff_ev + tol_ev:
-            res.sey_50ev = 1
-        else:
-            res.bse_50ev = 1
+        uvw0 = list(entry["vacuum_direction_out"])
 
-        primary_id = int(trajectory_id) if trajectory_id is not None else -1
-        uvw_ref = _vec3(entry["vacuum_direction_out"])
-        if cfg.collect_spectra:
-            res.emissions.append(
-                Emission(
-                    energy=float(E0),
-                    uz=_dot3(uvw_ref, outward),
-                    is_cascade=False,
-                    generation=0,
-                    birth_depth=0.0,
-                    electron_id=primary_id,
-                    parent_id=None,
-                    root_primary_id=primary_id,
-                    xyz=_vec3(launch_position),
-                    uvw=uvw_ref,
-                    surface_id=getattr(geometry, "surface_id", "sample"),
-                    surface_normal=outward,
-                    region_from=getattr(geometry, "vacuum_region", VACUUM_REGION),
-                    region_to=getattr(geometry, "vacuum_region", VACUUM_REGION),
-                    primitive_id=0,
-                    emission_mechanism="incoming_barrier_reflection",
-                    barrier_reflection_probability=float(entry["R"]),
-                )
+        recorder = _HistoryRecorder(
+            vacuum, E0, history_angle, launch_position=launch_position,
+            trajectory_id=trajectory_id, geometry=geometry,
+            reference_surface_normal=surface_normal,
+        ) if history else None
+
+        if recorder is not None:
+            primary_id = recorder.register_primary(
+                float(E0), launch_position, vacuum
             )
-
-        if track:
-            # A reflected-at-entry trajectory has no solid free flight. Store
-            # the surface point once so plotting code can still represent it.
-            res.tracks.append([[
-                round(float(launch_position[0]), 3),
-                round(float(launch_position[1]), 3),
-                round(float(launch_position[2]), 3),
-                round(float(E0), 3),
-            ]])
-            res.track_times_fs.append([0.0])
-            res.track_electron_ids.append(primary_id)
-
-        if history:
-            recorder = _HistoryRecorder(
-                vacuum, E0, history_angle, launch_position=launch_position,
-                trajectory_id=trajectory_id, geometry=geometry,
-                reference_surface_normal=surface_normal,
-            )
-            rid = recorder.register_primary(float(E0), launch_position, vacuum)
-            record = recorder._record_for(rid)
+            record = recorder._record_for(primary_id)
             record.surface_encounters += 1
-            record.fate = "emitted"
-            record.final_position = _vec3(launch_position)
-            record.final_energy = float(E0)
-            record.final_direction = uvw_ref
-            record.final_time_fs = 0.0
             recorder._event(
-                electron_id=rid,
+                electron_id=primary_id,
                 kind="incoming_barrier_reflection",
                 position=_vec3(launch_position),
                 energy_before=float(E0),
                 energy_after=float(E0),
                 direction_before=_vec3(vacuum),
-                direction_after=uvw_ref,
+                direction_after=_vec3(uvw0),
                 time_fs=0.0,
                 outcome="reflected_to_vacuum",
                 surface_id=getattr(geometry, "surface_id", "sample"),
                 surface_normal=outward,
-                region_from=getattr(geometry, "vacuum_region", VACUUM_REGION),
-                region_to=getattr(geometry, "vacuum_region", VACUUM_REGION),
+                region_from=vacuum_region,
+                region_to=vacuum_region,
                 primitive_id=0,
                 metadata={
                     "reflection_probability": float(entry["R"]),
                     "E_perp_vac_eV": float(entry["E_perp_vac"]),
                 },
             )
-            res.history = recorder.history
-        return res
+        elif trajectory_id is not None:
+            primary_id = int(trajectory_id)
+        else:
+            primary_id = -1
 
-    diag["incoming_barrier_transmissions"] += 1
-    E_s = float(entry["E_s"])
-    uvw0 = list(entry["solid_direction"])
+        primary = Electron(
+            sample, float(E0), launch_position, uvw0,
+            generation=0, is_cascade=False, rng=rng,
+            save_coordinates=track, electron_id=primary_id,
+            parent_id=None, root_primary_id=primary_id,
+            history=recorder, geometry=geometry,
+            current_region=vacuum_region, birth_time_fs=0.0,
+        )
+        primary.last_emission_surface = SurfaceHit(
+            distance=0.0,
+            position=_vec3(launch_position),
+            normal=outward,
+            surface_id=getattr(geometry, "surface_id", "sample"),
+            region_from=solid_region,
+            region_to=vacuum_region,
+            primitive_id=0,
+        )
+        primary.final_emission_mechanism = "incoming_barrier_reflection"
+        primary.barrier_reflection_probability = float(entry["R"])
+        queue = [primary]
 
-    recorder = _HistoryRecorder(
-        uvw0, E0, history_angle, launch_position=launch_position,
-        trajectory_id=trajectory_id, geometry=geometry,
-        reference_surface_normal=surface_normal,
-    ) if history else None
-    # Keep a lightweight primary association even when full collision history
-    # is disabled.  High-statistics spectrum workflows need per-primary
-    # emission counts for uncertainty estimates, but should not have to retain
-    # every collision record merely to identify the originating trajectory.
-    if recorder is not None:
-        primary_id = recorder.register_primary(E_s, launch_position, uvw0)
-    elif trajectory_id is not None:
-        primary_id = int(trajectory_id)
     else:
-        primary_id = -1
-    queue = [Electron(sample, E_s, launch_position, uvw0,
-                      generation=0, is_cascade=False, rng=rng,
-                      save_coordinates=track, electron_id=primary_id,
-                      parent_id=None, root_primary_id=primary_id,
-                      history=recorder, geometry=geometry,
-                      current_region=initial_region, birth_time_fs=0.0)]
+        diag["incoming_barrier_transmissions"] += 1
+        E_s = float(entry["E_s"])
+        uvw0 = list(entry["solid_direction"])
+
+        recorder = _HistoryRecorder(
+            uvw0, E0, history_angle, launch_position=launch_position,
+            trajectory_id=trajectory_id, geometry=geometry,
+            reference_surface_normal=surface_normal,
+        ) if history else None
+
+        # Keep a lightweight primary association even when full collision
+        # history is disabled.
+        if recorder is not None:
+            primary_id = recorder.register_primary(E_s, launch_position, uvw0)
+        elif trajectory_id is not None:
+            primary_id = int(trajectory_id)
+        else:
+            primary_id = -1
+
+        queue = [Electron(
+            sample, E_s, launch_position, uvw0,
+            generation=0, is_cascade=False, rng=rng,
+            save_coordinates=track, electron_id=primary_id,
+            parent_id=None, root_primary_id=primary_id,
+            history=recorder, geometry=geometry,
+            current_region=initial_region, birth_time_fs=0.0,
+        )]
 
     i = 0
     while i < len(queue):
@@ -2705,6 +2870,38 @@ def simulate_trajectory(sample: Sample, E0, angle_rad, rng, track=False,
                 e.fate = "step_limit"
                 break
 
+            if not e.inside:
+                # Vacuum is collision-free.  Trace a straight ray to the next
+                # exposed surface of the complete scene.  If there is none,
+                # this is the first point at which the electron is truly
+                # emitted/detected.
+                diag["vacuum_flights"] += 1
+                hit_again = e.travel_vacuum()
+                if not hit_again:
+                    _finalize_emission(e)
+                    break
+
+                diag["surface_encounters"] += 1
+                diag["vacuum_surface_hits"] += 1
+                diag["incoming_barrier_encounters"] += 1
+                energy_before_surface = e.energy
+                direction_before_surface = list(e.uvw)
+                transmitted, reentry = e.enter_from_vacuum()
+                if transmitted:
+                    diag["incoming_barrier_transmissions"] += 1
+                    diag["vacuum_reentries"] += 1
+                else:
+                    diag["incoming_barrier_reflections"] += 1
+                    diag["vacuum_barrier_reflections"] += 1
+                if recorder is not None:
+                    recorder.record_vacuum_surface(
+                        e, transmitted, energy_before_surface,
+                        direction_before_surface, reentry,
+                    )
+                # Whether transmitted or reflected, the boundary consumed no
+                # bulk collision.  Continue from the new region/state.
+                continue
+
             hit_surface = e.travel()
             if e.dead:
                 break
@@ -2720,43 +2917,14 @@ def simulate_trajectory(sample: Sample, E0, angle_rad, rng, track=False,
                         direction_before_surface,
                     )
                 if escaped:
-                    diag["escapes"] += 1
-                    res.tey += 1
-                    if e.is_cascade:
-                        res.sey_cascade += 1
-                    else:
-                        res.bse_cascade += 1
-                    tol_ev = 1e-9
-
-                    if e.energy <= cfg.bse_cutoff_ev + tol_ev:
-                        res.sey_50ev += 1
-                    else:
-                        res.bse_50ev += 1
-                    if cfg.collect_spectra:
-                        hit = e.last_surface_hit
-                        res.emissions.append(
-                            Emission(
-                                energy=e.energy,
-                                uz=_dot3(e.uvw, hit.normal),
-                                is_cascade=e.is_cascade,
-                                generation=e.generation,
-                                birth_depth=e.birth_depth,
-                                electron_id=e.electron_id,
-                                parent_id=e.parent_id,
-                                root_primary_id=e.root_primary_id,
-                                xyz=_vec3(e.xyz),
-                                uvw=_vec3(e.uvw),
-                                surface_id=hit.surface_id,
-                                surface_normal=_vec3(hit.normal),
-                                region_from=hit.region_from,
-                                region_to=hit.region_to,
-                                primitive_id=hit.primitive_id,
-                            )
-                        )
-                    break
+                    # Local solid->vacuum transmission is NOT final emission.
+                    # Continue ballistically through vacuum; a neighbouring
+                    # line or the substrate may recapture the electron.
+                    diag["surface_transmissions_to_vacuum"] += 1
+                    continue
                 diag["internal_reflections"] += 1
-                # KEY FIX: a step truncated at the surface produced no
-                # collision.  Draw a fresh free path instead of forcing one.
+                # A step truncated at the surface produced no collision. Draw
+                # a fresh free path instead of forcing one.
                 continue
 
             secondary = e.scatter(diag)
